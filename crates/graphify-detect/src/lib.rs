@@ -129,7 +129,7 @@ fn detect_inner(
 
         if is_sensitive(path) {
             if let Ok(rel) = path.strip_prefix(root) {
-                skipped_sensitive.push(rel.to_string_lossy().into_owned());
+                skipped_sensitive.push(path_to_forward_slashes(rel));
             }
             debug!("skipping sensitive file: {}", path.display());
             continue;
@@ -140,11 +140,7 @@ fn detect_inner(
             None => continue,
         };
 
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .into_owned();
+        let rel = path_to_forward_slashes(path.strip_prefix(root).unwrap_or(path));
 
         if compute_hashes {
             if let Some(old) = old_hashes.and_then(|h| h.get(&rel)) {
@@ -320,6 +316,10 @@ fn should_skip_entry(entry: &walkdir::DirEntry, root: &Path, ignore_set: &Ignore
     }
 
     false
+}
+
+fn path_to_forward_slashes(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// Returns `true` if a directory name is a known "noise" directory.
