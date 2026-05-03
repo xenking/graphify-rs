@@ -143,26 +143,17 @@ fn detect_inner(
         let rel = path_to_forward_slashes(path.strip_prefix(root).unwrap_or(path));
 
         if compute_hashes {
-            if let Some(old) = old_hashes.and_then(|h| h.get(&rel)) {
+            if let Some(_old) = old_hashes.and_then(|h| h.get(&rel)) {
                 let full_path = root.join(&rel);
                 match fs::read_to_string(&full_path) {
                     Ok(content) => {
                         let hash = graphify_cache::content_hash(content.as_bytes());
                         hashes.insert(rel.clone(), hash.clone());
-                        if old == &hash {
-                            total_words += content.split_whitespace().count();
-                            files.entry(file_type).or_default(); // ensure key exists
-                            continue;
-                        }
                         total_words += content.split_whitespace().count();
                     }
                     Err(_) => {
                         let hash = graphify_cache::file_hash(path).unwrap_or_default();
                         hashes.insert(rel.clone(), hash.clone());
-                        if old == &hash {
-                            files.entry(file_type).or_default();
-                            continue;
-                        }
                     }
                 }
             } else {
@@ -240,12 +231,14 @@ fn detect_inner(
     (result, if compute_hashes { Some(hashes) } else { None })
 }
 
-/// Incremental detection: compares against a stored manifest and returns only
-/// changed / new files. Uses content hashes to detect modifications in
-/// existing files.
+/// Incremental detection: refreshes the manifest while still returning the full
+/// current file set.
 ///
-/// Computes hashes during the directory walk (sharing file reads with word
-/// counting) so unchanged files are never re-read.
+/// The build pipeline needs the full file set to produce a complete graph on
+/// every run. Incrementality is handled by the SHA256 extraction cache, which
+/// skips unchanged file contents. Older behavior returned only files missing
+/// from the manifest, which made `graphify-rs build --update` capable of
+/// overwriting `graph.json` with a partial graph.
 pub fn detect_incremental(root: &Path, manifest_path: Option<&str>) -> DetectResult {
     let manifest_file = root.join(manifest_path.unwrap_or(DEFAULT_MANIFEST_NAME));
     let old_manifest = load_manifest(&manifest_file).unwrap_or_default();
@@ -273,14 +266,19 @@ pub fn detect_incremental(root: &Path, manifest_path: Option<&str>) -> DetectRes
         }
     }
 
-    let filtered_total: usize = result.files.values().map(std::vec::Vec::len).sum();
+    let changed_total = result
+        .files
+        .values()
+        .flat_map(|paths| paths.iter())
+        .filter(|path| old_manifest.hashes.get(*path) != new_hashes.get(*path))
+        .count();
 
     if let Err(e) = save_manifest(&manifest_file, &new_manifest) {
         warn!("failed to save manifest: {e}");
     }
 
     info!(
-        "detect_incremental: {filtered_total} new/changed files (total {total} on disk)",
+        "detect_incremental: {changed_total} new/changed files (total {total} on disk; unchanged extraction is skipped by SHA256 cache)",
         total = result.total_files,
     );
 
@@ -520,24 +518,21 @@ mod tests {
     }
 
     #[test]
-    fn detect_incremental_filters_known() {
+    fn detect_incremental_returns_full_file_set_for_complete_graphs() {
         let dir = make_test_tree();
         let root = dir.path();
 
         let r1 = detect_incremental(root, None);
         assert!(r1.total_files >= 3);
 
+        // Second run still returns all files: the extraction cache, not
+        // detection filtering, provides incrementality without partial graphs.
         let r2 = detect_incremental(root, None);
-        let r2_new_count: usize = r2.files.values().map(|v| v.len()).sum();
-        assert_eq!(
-            r2_new_count, 0,
-            "no new/changed files expected on second run"
-        );
+        assert_eq!(r2.total_files, r1.total_files);
 
         fs::write(root.join("new_file.ts"), "const x = 1;").unwrap();
         let r3 = detect_incremental(root, None);
-        let r3_new_count: usize = r3.files.values().map(|v| v.len()).sum();
-        assert_eq!(r3_new_count, 1, "expected exactly 1 new file");
+        assert_eq!(r3.total_files, r1.total_files + 1);
         let code = r3.files.get(&FileType::Code).expect("expected code");
         assert!(code.iter().any(|p| p.contains("new_file.ts")));
     }
