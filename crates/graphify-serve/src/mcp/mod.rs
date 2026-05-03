@@ -117,6 +117,11 @@ fn dispatch(graph: &KnowledgeGraph, request: &Value) -> Option<Value> {
     }
 }
 
+/// Handle one JSON-RPC request against an already loaded graph.
+pub fn handle_jsonrpc(graph: &KnowledgeGraph, request: &Value) -> Option<Value> {
+    dispatch(graph, request)
+}
+
 /// Start the MCP server, reading JSON-RPC requests from stdin and writing
 /// responses to stdout. Logs go to stderr so they don't interfere with the
 /// protocol.

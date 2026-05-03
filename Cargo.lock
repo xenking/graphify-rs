@@ -781,6 +781,7 @@ dependencies = [
  "graphify-watch",
  "indicatif",
  "rayon",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -802,11 +803,14 @@ dependencies = [
 name = "graphify-serve"
 version = "0.5.0"
 dependencies = [
+ "anyhow",
  "graphify-analyze",
  "graphify-core",
  "graphify-security",
+ "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
