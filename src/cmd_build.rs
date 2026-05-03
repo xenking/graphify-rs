@@ -23,6 +23,8 @@ pub async fn cmd_build(
     jobs: Option<usize>,
     max_viz_nodes: Option<usize>,
     llm_config: Option<crate::config::LLMConfig>,
+    embed: bool,
+    embedding_model: &str,
 ) -> Result<()> {
     let root = PathBuf::from(path);
     let output_dir = PathBuf::from(output);
@@ -74,6 +76,27 @@ pub async fn cmd_build(
     let god_list = graphify_analyze::god_nodes(&graph, 10);
     let surprise_list = graphify_analyze::surprising_connections(&graph, &communities, 5);
     let questions = graphify_analyze::suggest_questions(&graph, &communities, &community_labels, 7);
+
+    if embed {
+        info_print!(
+            verb,
+            "  {} semantic index with {}...",
+            "Embedding".cyan(),
+            embedding_model
+        );
+        let index = graphify_embed::build_model2vec_index(&graph, Some(&root), embedding_model)
+            .with_context(|| format!("Failed to build semantic index with {embedding_model}"))?;
+        let index_path = output_dir.join(graphify_embed::DEFAULT_INDEX_FILE);
+        graphify_embed::write_index(&index, &index_path)
+            .with_context(|| format!("Failed to write {}", index_path.display()))?;
+        info_print!(
+            verb,
+            "  Wrote {} ({} nodes, dim {})",
+            index_path.display().to_string().dimmed(),
+            index.nodes.len(),
+            index.dim
+        );
+    }
 
     step_export(
         &graph,

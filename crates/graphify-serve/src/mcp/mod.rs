@@ -13,7 +13,7 @@ use graphify_core::graph::KnowledgeGraph;
 use serde_json::{Value, json};
 use tracing::{debug, error, info};
 
-use crate::ServeError;
+use crate::{SemanticState, ServeError, load_semantic_state};
 
 const SERVER_NAME: &str = "graphify-rs";
 const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -38,7 +38,11 @@ fn jsonrpc_error(id: &Value, code: i64, message: &str) -> Value {
     })
 }
 
-fn dispatch_tools_call(graph: &KnowledgeGraph, request: &Value) -> Value {
+fn dispatch_tools_call(
+    graph: &KnowledgeGraph,
+    semantic: Option<&SemanticState>,
+    request: &Value,
+) -> Value {
     let id = &request["id"];
     let tool_name = request["params"]["name"].as_str().unwrap_or("");
     let args = &request["params"]["arguments"];
@@ -46,7 +50,7 @@ fn dispatch_tools_call(graph: &KnowledgeGraph, request: &Value) -> Value {
     debug!("tools/call: {tool_name}");
 
     let result = match tool_name {
-        "query_graph" => handlers::handle_query_graph(graph, args),
+        "query_graph" => handlers::handle_query_graph(graph, semantic, args),
         "get_node" => handlers::handle_get_node(graph, args),
         "get_neighbors" => handlers::handle_get_neighbors(graph, args),
         "get_community" => handlers::handle_get_community(graph, args),
@@ -60,6 +64,7 @@ fn dispatch_tools_call(graph: &KnowledgeGraph, request: &Value) -> Value {
         "pagerank" => handlers::handle_pagerank(graph, args),
         "detect_cycles" => handlers::handle_detect_cycles(graph, args),
         "smart_summary" => handlers::handle_smart_summary(graph, args),
+        "semantic_query" => handlers::handle_semantic_query(graph, semantic, args),
         "find_similar" => handlers::handle_find_similar(graph, args),
         _ => handlers::tool_result_error(&format!("Unknown tool: {tool_name}")),
     };
@@ -67,7 +72,11 @@ fn dispatch_tools_call(graph: &KnowledgeGraph, request: &Value) -> Value {
     jsonrpc_response(id, result)
 }
 
-fn dispatch(graph: &KnowledgeGraph, request: &Value) -> Option<Value> {
+fn dispatch_with_semantic(
+    graph: &KnowledgeGraph,
+    semantic: Option<&SemanticState>,
+    request: &Value,
+) -> Option<Value> {
     let method = request["method"].as_str().unwrap_or("");
     let id = &request["id"];
 
@@ -101,7 +110,7 @@ fn dispatch(graph: &KnowledgeGraph, request: &Value) -> Option<Value> {
                 }),
             ))
         }
-        "tools/call" => Some(dispatch_tools_call(graph, request)),
+        "tools/call" => Some(dispatch_tools_call(graph, semantic, request)),
         "ping" => Some(jsonrpc_response(id, json!({}))),
         _ => {
             if id.is_null() {
@@ -117,9 +126,22 @@ fn dispatch(graph: &KnowledgeGraph, request: &Value) -> Option<Value> {
     }
 }
 
+#[cfg(test)]
+fn dispatch(graph: &KnowledgeGraph, request: &Value) -> Option<Value> {
+    dispatch_with_semantic(graph, None, request)
+}
+
 /// Handle one JSON-RPC request against an already loaded graph.
 pub fn handle_jsonrpc(graph: &KnowledgeGraph, request: &Value) -> Option<Value> {
-    dispatch(graph, request)
+    dispatch_with_semantic(graph, None, request)
+}
+
+pub fn handle_jsonrpc_with_semantic(
+    graph: &KnowledgeGraph,
+    semantic: Option<&SemanticState>,
+    request: &Value,
+) -> Option<Value> {
+    dispatch_with_semantic(graph, semantic, request)
 }
 
 /// Start the MCP server, reading JSON-RPC requests from stdin and writing
@@ -127,6 +149,7 @@ pub fn handle_jsonrpc(graph: &KnowledgeGraph, request: &Value) -> Option<Value> 
 /// protocol.
 pub fn run_mcp_server(graph_path: &Path) -> Result<(), ServeError> {
     let graph = crate::load_graph(graph_path)?;
+    let semantic = load_semantic_state(graph_path, &graph);
     let stats = crate::graph_stats(&graph);
     let null = Value::Null;
     info!(
@@ -166,7 +189,7 @@ pub fn run_mcp_server(graph_path: &Path) -> Result<(), ServeError> {
             }
         };
 
-        if let Some(response) = dispatch(&graph, &request) {
+        if let Some(response) = handle_jsonrpc_with_semantic(&graph, semantic.as_ref(), &request) {
             let out = match serde_json::to_string(&response) {
                 Ok(s) => s,
                 Err(e) => {
@@ -252,10 +275,11 @@ mod tests {
         let req = json!({"jsonrpc": "2.0", "method": "tools/list", "id": 2});
         let resp = dispatch(&g, &req).unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 15);
+        assert_eq!(tools.len(), 16);
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"query_graph"));
+        assert!(names.contains(&"semantic_query"));
         assert!(names.contains(&"get_node"));
         assert!(names.contains(&"get_neighbors"));
         assert!(names.contains(&"get_community"));

@@ -59,6 +59,12 @@ enum Commands {
         /// Maximum nodes in HTML visualization (default: 2000). Larger values may slow browser.
         #[arg(long)]
         max_viz_nodes: Option<usize>,
+        /// Build a local Model2Vec semantic index next to graph.json.
+        #[arg(long)]
+        embed: bool,
+        /// Model2Vec model ID or local model directory for --embed.
+        #[arg(long)]
+        embedding_model: Option<String>,
     },
     /// Install graphify skill for AI coding assistant
     Install {
@@ -74,6 +80,9 @@ enum Commands {
         budget: usize,
         #[arg(long, default_value = DEFAULT_GRAPH_PATH)]
         graph: String,
+        /// Disable semantic-index lookup even if .graphify/semantic-index.json exists.
+        #[arg(long)]
+        no_semantic: bool,
     },
     /// Run benchmark
     Benchmark {
@@ -302,6 +311,8 @@ async fn main() -> Result<()> {
             update,
             format,
             max_viz_nodes,
+            embed,
+            embedding_model,
         } => {
             let app_cfg = config::load_config(Path::new(&path));
             let effective_path = path;
@@ -312,6 +323,10 @@ async fn main() -> Result<()> {
             };
             let effective_no_llm = no_llm || app_cfg.no_llm.unwrap_or(false);
             let effective_code_only = code_only || app_cfg.code_only.unwrap_or(false);
+            let effective_embed = embed || app_cfg.embed.unwrap_or(false);
+            let effective_embedding_model = embedding_model
+                .or(app_cfg.embedding_model)
+                .unwrap_or_else(|| graphify_embed::DEFAULT_MODEL.to_string());
             let effective_formats = if format.is_empty() {
                 app_cfg.formats.unwrap_or_default()
             } else {
@@ -331,6 +346,8 @@ async fn main() -> Result<()> {
                 cli.jobs,
                 max_viz_nodes,
                 app_cfg.llm,
+                effective_embed,
+                &effective_embedding_model,
             )
             .await?;
         }
@@ -342,8 +359,9 @@ async fn main() -> Result<()> {
             dfs,
             budget,
             graph,
+            no_semantic,
         } => {
-            cmd_query(&question, dfs, budget, &graph)?;
+            cmd_query(&question, dfs, budget, &graph, !no_semantic)?;
         }
         Commands::Benchmark { graph_path } => {
             let result = graphify_benchmark::run_benchmark(Path::new(&graph_path), None)?;
@@ -499,19 +517,22 @@ fn ensure_local_output_excluded(project_root: &Path, output_dir: &Path) {
     }
 
     let mut output = existing;
-    if !output.is_empty() && !output.ends_with('
-') {
-        output.push('
-');
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
     }
     output.push_str(&entry);
-    output.push('
-');
+    output.push('\n');
     let _ = std::fs::write(exclude_path, output);
 }
 
 /// Query the knowledge graph
-fn cmd_query(question: &str, use_dfs: bool, budget: usize, graph_path: &str) -> Result<()> {
+fn cmd_query(
+    question: &str,
+    use_dfs: bool,
+    budget: usize,
+    graph_path: &str,
+    use_semantic: bool,
+) -> Result<()> {
     let gp = PathBuf::from(graph_path);
     if !gp.exists() {
         anyhow::bail!("Graph file not found: {}", gp.display());
@@ -529,13 +550,43 @@ fn cmd_query(question: &str, use_dfs: bool, budget: usize, graph_path: &str) -> 
         .map(str::to_lowercase)
         .collect();
 
-    let scored = graphify_serve::score_nodes(&graph, &terms);
-    if scored.is_empty() {
+    let semantic_start = if use_semantic {
+        let index_path = graphify_embed::default_index_path_for_graph(&gp);
+        if index_path.exists() {
+            match graphify_embed::SemanticEngine::load_for_graph(&index_path, &graph)
+                .and_then(|engine| engine.query(&graph, question, 5))
+            {
+                Ok(matches) if !matches.is_empty() => {
+                    matches.into_iter().map(|m| m.node_id).collect()
+                }
+                Ok(_) => Vec::new(),
+                Err(err) => {
+                    eprintln!(
+                        "{} semantic index unavailable, falling back to lexical query: {err:#}",
+                        "⚠".yellow()
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let start = if semantic_start.is_empty() {
+        let scored = graphify_serve::score_nodes(&graph, &terms);
+        scored.iter().take(5).map(|(_, id)| id.clone()).collect()
+    } else {
+        semantic_start
+    };
+
+    if start.is_empty() {
         println!("No matching nodes found.");
         return Ok(());
     }
 
-    let start: Vec<String> = scored.iter().take(5).map(|(_, id)| id.clone()).collect();
     let (nodes, edges) = if use_dfs {
         graphify_serve::dfs(&graph, &start, 2)
     } else {
@@ -765,6 +816,10 @@ fn cmd_init() -> Result<()> {
 
 # Only process code files (skip docs/papers)
 # code_only = false
+
+# Build a local Model2Vec semantic index next to graph.json
+# embed = false
+# embedding_model = "minishlab/potion-code-16M"
 
 # Export formats (comma-separated). Available: json,html,graphml,cypher,svg,wiki,obsidian,report
 # Leave empty or omit for all formats.

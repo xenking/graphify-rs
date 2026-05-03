@@ -4,8 +4,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use graphify_core::graph::KnowledgeGraph;
 use serde_json::{Value, json};
+use tracing::debug;
 
-use crate::{bfs, graph_stats, score_nodes, subgraph_to_text};
+use crate::{SemanticState, bfs, graph_stats, score_nodes, subgraph_to_text};
 
 pub(crate) fn tool_result_text(text: &str) -> Value {
     json!({
@@ -32,7 +33,11 @@ pub(crate) fn tool_result_error(text: &str) -> Value {
     })
 }
 
-pub(crate) fn handle_query_graph(graph: &KnowledgeGraph, args: &Value) -> Value {
+pub(crate) fn handle_query_graph(
+    graph: &KnowledgeGraph,
+    semantic: Option<&SemanticState>,
+    args: &Value,
+) -> Value {
     let question = args["question"].as_str().unwrap_or("");
     let budget = args["budget"].as_u64().unwrap_or(2000) as usize;
 
@@ -50,12 +55,30 @@ pub(crate) fn handle_query_graph(graph: &KnowledgeGraph, args: &Value) -> Value 
         return tool_result_text("No meaningful search terms found in the question.");
     }
 
-    let scored = score_nodes(graph, &terms);
-    if scored.is_empty() {
+    let start = if let Some(semantic) = semantic {
+        match semantic.query(graph, question, 5) {
+            Ok(matches) if !matches.is_empty() => matches.into_iter().map(|m| m.node_id).collect(),
+            Ok(_) => Vec::new(),
+            Err(err) => {
+                debug!("semantic query unavailable, falling back to lexical query: {err}");
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    let start = if start.is_empty() {
+        let scored = score_nodes(graph, &terms);
+        scored.iter().take(5).map(|(_, id)| id.clone()).collect()
+    } else {
+        start
+    };
+
+    if start.is_empty() {
         return tool_result_text("No matching nodes found for the given question.");
     }
 
-    let start: Vec<String> = scored.iter().take(5).map(|(_, id)| id.clone()).collect();
     let (nodes, edges) = bfs(graph, &start, 2);
     let text = subgraph_to_text(graph, &nodes, &edges, budget);
 
@@ -485,5 +508,29 @@ pub(crate) fn handle_find_similar(graph: &KnowledgeGraph, args: &Value) -> Value
         tool_result_text("No structurally similar node pairs found.")
     } else {
         tool_result_json(&pairs)
+    }
+}
+
+
+pub(crate) fn handle_semantic_query(
+    graph: &KnowledgeGraph,
+    semantic: Option<&SemanticState>,
+    args: &Value,
+) -> Value {
+    let question = args["question"].as_str().unwrap_or("");
+    let top_n = args["top_n"].as_u64().unwrap_or(10) as usize;
+    if question.is_empty() {
+        return tool_result_error("Missing required parameter: question");
+    }
+    let Some(semantic) = semantic else {
+        return tool_result_error(
+            "Semantic index not loaded. Run `graphify-rs build --embed` to create .graphify/semantic-index.json.",
+        );
+    };
+
+    match semantic.query(graph, question, top_n) {
+        Ok(matches) if matches.is_empty() => tool_result_text("No semantic matches found."),
+        Ok(matches) => tool_result_json(&matches),
+        Err(err) => tool_result_error(&format!("{err}")),
     }
 }
