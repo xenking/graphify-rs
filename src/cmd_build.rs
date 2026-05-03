@@ -24,14 +24,16 @@ pub async fn cmd_build(
     max_viz_nodes: Option<usize>,
     llm_config: Option<crate::config::LLMConfig>,
     embed: bool,
+    embedding_provider: &str,
     embedding_model: &str,
+    anthropic_semantic: bool,
 ) -> Result<()> {
     let root = PathBuf::from(path);
     let output_dir = PathBuf::from(output);
     let cache_dir = output_dir.join("cache");
 
     let all_formats = [
-        "json", "html", "graphml", "cypher", "svg", "wiki", "obsidian", "report",
+        "json", "html", "graphml", "cypher", "svg", "wiki", "obsidian", "report", "context",
     ];
     let selected: Vec<&str> = if formats.is_empty() {
         all_formats.to_vec()
@@ -44,7 +46,11 @@ pub async fn cmd_build(
 
     let mut extractions = step_extract_ast(&root, &cache_dir, &detection, code_only, verb)?;
 
-    if !no_llm && !code_only {
+    if !code_only {
+        step_extract_documents(&root, &detection, &mut extractions, verb);
+    }
+
+    if !no_llm && !code_only && (llm_config.is_some() || anthropic_semantic) {
         step_extract_semantic(
             &root,
             &cache_dir,
@@ -53,6 +59,7 @@ pub async fn cmd_build(
             verb,
             jobs,
             llm_config.as_ref(),
+            anthropic_semantic,
         )
         .await;
     }
@@ -82,10 +89,15 @@ pub async fn cmd_build(
             verb,
             "  {} semantic index with {}...",
             "Embedding".cyan(),
-            embedding_model
+            format!("{embedding_provider}:{embedding_model}")
         );
-        let index = graphify_embed::build_model2vec_index(&graph, Some(&root), embedding_model)
-            .with_context(|| format!("Failed to build semantic index with {embedding_model}"))?;
+        let (provider, model) = if let Some((provider, model)) = embedding_model.split_once(':') {
+            (provider, model)
+        } else {
+            (embedding_provider, embedding_model)
+        };
+        let index = graphify_embed::build_semantic_index(&graph, Some(&root), provider, model)
+            .with_context(|| format!("Failed to build semantic index with {provider}:{model}"))?;
         let index_path = output_dir.join(graphify_embed::DEFAULT_INDEX_FILE);
         graphify_embed::write_index(&index, &index_path)
             .with_context(|| format!("Failed to write {}", index_path.display()))?;
@@ -293,6 +305,40 @@ fn step_extract_ast(
     Ok(vec![ast_result])
 }
 
+fn step_extract_documents(
+    root: &Path,
+    detection: &graphify_detect::DetectResult,
+    extractions: &mut Vec<graphify_core::model::ExtractionResult>,
+    verb: Verbosity,
+) {
+    let doc_files: Vec<PathBuf> = detection
+        .files
+        .get(&graphify_detect::FileType::Document)
+        .into_iter()
+        .chain(detection.files.get(&graphify_detect::FileType::Paper))
+        .flat_map(|v| v.iter().map(|f| root.join(f)))
+        .collect();
+
+    if doc_files.is_empty() {
+        return;
+    }
+
+    info_print!(
+        verb,
+        "  {} local document context from {} doc/paper files...",
+        "Extracting".cyan(),
+        doc_files.len()
+    );
+    let doc_result = graphify_extract::doc_extract::extract_documents(&doc_files);
+    info_print!(
+        verb,
+        "  Pass 1b (docs): {} nodes, {} edges",
+        doc_result.nodes.len().to_string().bold(),
+        doc_result.edges.len().to_string().bold()
+    );
+    extractions.push(doc_result);
+}
+
 async fn step_extract_semantic(
     root: &Path,
     cache_dir: &Path,
@@ -301,6 +347,7 @@ async fn step_extract_semantic(
     verb: Verbosity,
     jobs: Option<usize>,
     llm_config: Option<&crate::config::LLMConfig>,
+    anthropic_semantic: bool,
 ) {
     let n_doc = detection
         .files
@@ -311,7 +358,7 @@ async fn step_extract_semantic(
         .get(&graphify_detect::FileType::Paper)
         .map_or(0, std::vec::Vec::len);
 
-    let provider_config = resolve_llm_config(llm_config, verb);
+    let provider_config = resolve_llm_config(llm_config, verb, anthropic_semantic);
     if let Some(config) = provider_config {
         let doc_files: Vec<PathBuf> = detection
             .files
@@ -438,6 +485,7 @@ async fn step_extract_semantic(
 fn resolve_llm_config(
     llm_config: Option<&crate::config::LLMConfig>,
     verb: Verbosity,
+    allow_anthropic_env: bool,
 ) -> Option<graphify_extract::semantic::LLMProviderConfig> {
     if let Some(llm) = llm_config {
         let provider = llm.provider.as_deref().unwrap_or("");
@@ -461,7 +509,7 @@ fn resolve_llm_config(
                 None
             }
         }
-    } else {
+    } else if allow_anthropic_env {
         std::env::var("ANTHROPIC_API_KEY").ok().map(|key| {
             graphify_extract::semantic::LLMProviderConfig::resolve(
                 &graphify_extract::semantic::LLMConfigRaw {
@@ -473,6 +521,8 @@ fn resolve_llm_config(
             )
             .expect("hardcoded anthropic config should always resolve")
         })
+    } else {
+        None
     }
 }
 
@@ -512,6 +562,7 @@ fn step_cluster(
                             && !n.label.starts_with("std::")
                             && !n.label.starts_with("serde::")
                             && !n.label.contains("::")
+                            && graphify_core::quality::is_summary_candidate(n)
                     })
                     .max_by_key(|n| match n.node_type {
                         graphify_core::model::NodeType::Function => 3,
@@ -625,6 +676,16 @@ fn step_export(
             verb,
             "  Wrote {}",
             report_path.display().to_string().dimmed()
+        );
+    }
+
+    if should_export("context") {
+        let context = graphify_export::generate_llm_context(graph, communities, community_labels, root);
+        let context_path = graphify_export::export_llm_context(&context, output_dir)?;
+        info_print!(
+            verb,
+            "  Wrote {}",
+            context_path.display().to_string().dimmed()
         );
     }
 

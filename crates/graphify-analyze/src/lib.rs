@@ -9,6 +9,7 @@ use tracing::debug;
 
 use graphify_core::graph::KnowledgeGraph;
 use graphify_core::model::{BridgeNode, DependencyCycle, GodNode, PageRankNode, Surprise};
+use graphify_core::quality;
 
 /// Find the most-connected nodes, excluding file-level hubs and method stubs.
 ///
@@ -22,6 +23,13 @@ pub fn god_nodes(graph: &KnowledgeGraph, top_n: usize) -> Vec<GodNode> {
         .node_ids()
         .into_iter()
         .filter(|id| !is_file_node(graph, id) && !is_method_stub(graph, id))
+        .filter(|id| {
+            graph.get_node(id).is_some_and(|node| {
+                quality::is_summary_candidate(node)
+                    || (matches!(node.node_type, graphify_core::model::NodeType::Module)
+                        && generic_labels.contains(&node.label.as_str()))
+            })
+        })
         .map(|id| {
             let node = graph.get_node(&id).unwrap();
             let label = if generic_labels.contains(&node.label.as_str()) {
@@ -38,7 +46,7 @@ pub fn god_nodes(graph: &KnowledgeGraph, top_n: usize) -> Vec<GodNode> {
         })
         .collect();
 
-    candidates.sort_by_key(|b| std::cmp::Reverse(b.degree));
+    candidates.sort_by(|a, b| b.degree.cmp(&a.degree).then_with(|| a.label.cmp(&b.label)));
     candidates.truncate(top_n);
     debug!("found {} god node candidates", candidates.len());
     candidates
@@ -89,6 +97,11 @@ pub fn surprising_connections(
             continue;
         }
         if is_method_stub(graph, src) || is_method_stub(graph, tgt) {
+            continue;
+        }
+        if graph.get_node(src).is_some_and(quality::is_low_signal_node)
+            || graph.get_node(tgt).is_some_and(quality::is_low_signal_node)
+        {
             continue;
         }
 
@@ -183,6 +196,9 @@ pub fn suggest_questions(
 
         for id in graph.node_ids() {
             if is_file_node(graph, &id) {
+                continue;
+            }
+            if graph.get_node(&id).is_some_and(quality::is_low_signal_node) {
                 continue;
             }
             let nbrs = graph.get_neighbors(&id);

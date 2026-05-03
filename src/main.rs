@@ -53,7 +53,7 @@ enum Commands {
         /// Only re-extract new/modified files since last build
         #[arg(long)]
         update: bool,
-        /// Export formats (comma-separated). Available: json,html,graphml,cypher,svg,wiki,obsidian,report. Default: all
+        /// Export formats (comma-separated). Available: json,html,graphml,cypher,svg,wiki,obsidian,report,context. Default: all
         #[arg(long, value_delimiter = ',')]
         format: Vec<String>,
         /// Maximum nodes in HTML visualization (default: 2000). Larger values may slow browser.
@@ -62,9 +62,15 @@ enum Commands {
         /// Build a local Model2Vec semantic index next to graph.json.
         #[arg(long)]
         embed: bool,
-        /// Model2Vec model ID or local model directory for --embed.
+        /// Embedding provider for --embed: model2vec (local), ollama (local HTTP), or voyage (hosted API).
+        #[arg(long, default_value = graphify_embed::DEFAULT_PROVIDER)]
+        embedding_provider: String,
+        /// Embedding model ID/name for --embed. Prefixes like ollama:embeddinggemma and voyage:voyage-code-3 are also accepted.
         #[arg(long)]
         embedding_model: Option<String>,
+        /// Enable legacy Anthropic document semantic extraction. Default document indexing is local and does not require API keys.
+        #[arg(long)]
+        anthropic_semantic: bool,
     },
     /// Install graphify skill for AI coding assistant
     Install {
@@ -312,7 +318,9 @@ async fn main() -> Result<()> {
             format,
             max_viz_nodes,
             embed,
+            embedding_provider,
             embedding_model,
+            anthropic_semantic,
         } => {
             let app_cfg = config::load_config(Path::new(&path));
             let effective_path = path;
@@ -324,9 +332,24 @@ async fn main() -> Result<()> {
             let effective_no_llm = no_llm || app_cfg.no_llm.unwrap_or(false);
             let effective_code_only = code_only || app_cfg.code_only.unwrap_or(false);
             let effective_embed = embed || app_cfg.embed.unwrap_or(false);
-            let effective_embedding_model = embedding_model
-                .or(app_cfg.embedding_model)
-                .unwrap_or_else(|| graphify_embed::DEFAULT_MODEL.to_string());
+            let effective_embedding_provider =
+                if embedding_provider == graphify_embed::DEFAULT_PROVIDER {
+                    app_cfg
+                        .embedding_provider
+                        .unwrap_or_else(|| embedding_provider.clone())
+                } else {
+                    embedding_provider.clone()
+                };
+            let effective_embedding_model =
+                embedding_model.or(app_cfg.embedding_model).unwrap_or_else(|| {
+                    match effective_embedding_provider.as_str() {
+                        "ollama" => graphify_embed::DEFAULT_OLLAMA_MODEL.to_string(),
+                        "voyage" | "voyageai" => graphify_embed::DEFAULT_VOYAGE_MODEL.to_string(),
+                        _ => graphify_embed::DEFAULT_MODEL.to_string(),
+                    }
+                });
+            let effective_anthropic_semantic =
+                anthropic_semantic || app_cfg.anthropic_semantic.unwrap_or(false);
             let effective_formats = if format.is_empty() {
                 app_cfg.formats.unwrap_or_default()
             } else {
@@ -347,7 +370,9 @@ async fn main() -> Result<()> {
                 max_viz_nodes,
                 app_cfg.llm,
                 effective_embed,
+                &effective_embedding_provider,
                 &effective_embedding_model,
+                effective_anthropic_semantic,
             )
             .await?;
         }

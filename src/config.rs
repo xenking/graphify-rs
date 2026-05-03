@@ -10,7 +10,9 @@ pub struct Config {
     pub code_only: Option<bool>,
     pub formats: Option<Vec<String>>,
     pub embed: Option<bool>,
+    pub embedding_provider: Option<String>,
     pub embedding_model: Option<String>,
+    pub anthropic_semantic: Option<bool>,
     pub llm: Option<LLMConfig>,
 }
 
@@ -54,7 +56,9 @@ mod tests {
         assert!(cfg.code_only.is_none());
         assert!(cfg.formats.is_none());
         assert!(cfg.embed.is_none());
+        assert!(cfg.embedding_provider.is_none());
         assert!(cfg.embedding_model.is_none());
+        assert!(cfg.anthropic_semantic.is_none());
         assert!(cfg.llm.is_none());
     }
 
@@ -71,7 +75,9 @@ output = "my-output"
 no_llm = true
 formats = ["json", "html"]
 embed = true
+embedding_provider = "model2vec"
 embedding_model = "minishlab/potion-code-16M"
+anthropic_semantic = false
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.output.as_deref(), Some("my-output"));
@@ -81,6 +87,8 @@ embedding_model = "minishlab/potion-code-16M"
             Some(&["json".to_string(), "html".to_string()][..])
         );
         assert_eq!(cfg.embed, Some(true));
+        assert_eq!(cfg.embedding_provider.as_deref(), Some("model2vec"));
+        assert_eq!(cfg.anthropic_semantic, Some(false));
         assert_eq!(
             cfg.embedding_model.as_deref(),
             Some("minishlab/potion-code-16M")

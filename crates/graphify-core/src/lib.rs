@@ -3,6 +3,7 @@ pub mod error;
 pub mod graph;
 pub mod id;
 pub mod model;
+pub mod quality;
 
 use std::collections::HashMap;
 
