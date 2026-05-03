@@ -23,7 +23,7 @@ const PLATFORMS: &[(&str, PlatformConfig)] = &[
     (
         "codex",
         PlatformConfig {
-            skill_dst: ".agents/skills/graphify/SKILL.md",
+            skill_dst: ".codex/skills/graphify/SKILL.md",
             register_claude_md: false,
         },
     ),
@@ -84,28 +84,28 @@ const SKILL_REGISTRATION: &str = r#"
 When the user types `/graphify`, invoke the Skill tool with `skill: "graphify"` before doing anything else.
 "#;
 
-const CLAUDE_MD_SECTION: &str = r"## graphify
+const CLAUDE_MD_SECTION: &str = r#"## graphify
 
-This project has a graphify-rs knowledge graph at graphify-out/.
+This project has a graphify-rs knowledge graph at .graphify/.
 
 Rules:
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- After modifying code files in this session, run `graphify-rs build --path . --output graphify-out --no-llm --update` to keep the graph current (fast, AST-only, ~2-5s)
-";
+- Before answering architecture or codebase questions, read .graphify/GRAPH_REPORT.md for god nodes and community structure
+- If .graphify/wiki/index.md exists, navigate it instead of reading raw files
+- After modifying code files in this session, run `graphify-rs build --path . --output .graphify --no-llm --update` to keep the graph current (fast, AST-only, ~2-5s)
+"#;
 
 const CLAUDE_MD_MARKER: &str = "## graphify";
 
-const AGENTS_MD_SECTION: &str = r"## graphify
+const AGENTS_MD_SECTION: &str = r#"## graphify
 
-This project has a graphify-rs knowledge graph at graphify-out/.
+This project has a graphify-rs knowledge graph at .graphify/.
 
 Rules:
-- Before answering architecture or codebase questions, read graphify-out/GRAPH_REPORT.md for god nodes and community structure
+- Before answering architecture or codebase questions, read .graphify/GRAPH_REPORT.md for god nodes and community structure
 - Prefer `graphifyq query "<question>"` or `graphifyq summary architecture` when available; it starts/reuses a local HTTP MCP sidecar for graph queries
-- If graphify-out/wiki/index.md exists, navigate it instead of reading raw files
-- After modifying code files in this session, run `graphify-rs build --path . --output graphify-out --no-llm --update` to keep the graph current (fast, AST-only, ~2-5s)
-";
+- If .graphify/wiki/index.md exists, navigate it instead of reading raw files
+- After modifying code files in this session, run `graphify-rs build --path . --output .graphify --no-llm --update` to keep the graph current (fast, AST-only, ~2-5s)
+"#;
 
 const AGENTS_MD_MARKER: &str = "## graphify";
 
@@ -434,7 +434,7 @@ fn write_claude_settings_hook(path: &Path) -> Result<()> {
         "matcher": "Glob|Grep",
         "hooks": [{
             "type": "command",
-            "command": "[ -f graphify-out/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"graphify-rs: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files.\"}}' || true"
+            "command": "[ -f .graphify/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"graphify-rs: Knowledge graph exists. Read .graphify/GRAPH_REPORT.md for god nodes and community structure before searching raw files.\"}}' || true"
         }]
     });
 
@@ -505,7 +505,7 @@ fn write_codebuddy_settings_hook(path: &Path) -> Result<()> {
         "matcher": "Glob|Grep",
         "hooks": [{
             "type": "command",
-            "command": "[ -f graphify-out/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"graphify-rs: Knowledge graph exists. Read graphify-out/GRAPH_REPORT.md for god nodes and community structure before searching raw files.\"}}' || true"
+            "command": "[ -f .graphify/graph.json ] && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"additionalContext\":\"graphify-rs: Knowledge graph exists. Read .graphify/GRAPH_REPORT.md for god nodes and community structure before searching raw files.\"}}' || true"
         }]
     });
 
@@ -624,9 +624,9 @@ module.exports = {
     hooks: {
         preToolUse: async (ctx) => {
             const fs = require("fs");
-            if (fs.existsSync("graphify-out/graph.json")) {
+            if (fs.existsSync(".graphify/graph.json")) {
                 return {
-                    prefix: "[graphify-rs] Knowledge graph available. Read graphify-out/GRAPH_REPORT.md for architecture overview."
+                    prefix: "[graphify-rs] Knowledge graph available. Read .graphify/GRAPH_REPORT.md for architecture overview."
                 };
             }
         }
@@ -692,6 +692,23 @@ fn unregister_opencode_config(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn platform_skill_paths_include_claude_and_codex_skill_dirs() {
+        let claude = PLATFORMS
+            .iter()
+            .find(|(name, _)| *name == "claude")
+            .map(|(_, config)| config.skill_dst)
+            .unwrap();
+        let codex = PLATFORMS
+            .iter()
+            .find(|(name, _)| *name == "codex")
+            .map(|(_, config)| config.skill_dst)
+            .unwrap();
+
+        assert_eq!(claude, ".claude/skills/graphify/SKILL.md");
+        assert_eq!(codex, ".codex/skills/graphify/SKILL.md");
+    }
 
     #[test]
     fn codex_hook_preserves_existing_hooks_and_removes_unsupported_output() {
