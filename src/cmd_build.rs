@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -50,8 +50,22 @@ pub async fn cmd_build(
         step_extract_documents(&root, &detection, &mut extractions, verb);
     }
 
+    let doc_files = if code_only {
+        Vec::new()
+    } else {
+        collect_doc_files(&root, &detection)
+    };
+
+    let mut active_llm_dirs = HashSet::new();
+    if let Some(cli) = llm_cli {
+        active_llm_dirs.insert(llm::provider_cache_dir(&output_dir, &cli.provider));
+    }
+    if anthropic_semantic && !no_llm {
+        active_llm_dirs.insert(llm::provider_cache_dir(&output_dir, "anthropic"));
+        active_llm_dirs.insert(cache_dir.clone());
+    }
+
     if !no_llm && !code_only {
-        let doc_files = collect_doc_files(&root, &detection);
         if let Some(cli) = llm_cli
             && !doc_files.is_empty()
         {
@@ -79,6 +93,28 @@ pub async fn cmd_build(
                     "ℹ".blue()
                 );
             }
+        }
+    }
+
+    if !doc_files.is_empty() {
+        let preserved =
+            llm::load_preserved_extractions(&doc_files, &root, &output_dir, &active_llm_dirs);
+        if !preserved.is_empty() {
+            let stale = preserved
+                .iter()
+                .filter(|entry| entry.stale_preserved)
+                .count();
+            info_print!(
+                verb,
+                "  Preserved {} cached LLM extraction(s){}",
+                preserved.len().to_string().cyan(),
+                if stale > 0 {
+                    format!(" ({} stale by source hash)", stale)
+                } else {
+                    String::new()
+                }
+            );
+            extractions.extend(preserved.into_iter().map(|entry| entry.extraction));
         }
     }
 

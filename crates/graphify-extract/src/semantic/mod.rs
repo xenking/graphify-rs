@@ -148,6 +148,7 @@ fn platform_shell_command(command: &str) -> Command {
     }
 }
 
+
 fn build_system_prompt(file_type: &str) -> String {
     format!(
         "You are an expert knowledge-graph extraction engine. \
@@ -191,11 +192,19 @@ fn build_cli_prompt(content: &str, file_type: &str, existing: Option<&Extraction
     format!(
         "{system}
 
-         You are running as an external local CLI for graphify-rs.          Return ONLY the JSON object, with no markdown and no commentary.          If existing_extraction is not null, treat it as the previous graphify          extraction for this source file: update it for the current content,          preserve stable concise entity names where still valid, remove stale          relationships, and add newly discovered entities/relationships.
+\
+         You are running as an external local CLI for graphify-rs. \
+         Return ONLY the JSON object, with no markdown and no commentary. \
+         If existing_extraction is not null, treat it as the previous graphify \
+         extraction for this source file: update it for the current content, \
+         preserve stable concise entity names where still valid, remove stale \
+         relationships, and add newly discovered entities/relationships.
 
+\
          existing_extraction:
 {existing_json}
 
+\
          {user}"
     )
 }
@@ -394,5 +403,28 @@ mod tests {
         assert!(prompt.contains("existing_extraction"));
         assert!(prompt.contains("\"label\": \"Old\""));
         assert!(prompt.contains("Return ONLY the JSON object"));
+    }
+
+    #[test]
+    fn cli_command_uses_platform_shell() {
+        let command = platform_shell_command("echo ok");
+        #[cfg(windows)]
+        {
+            assert_eq!(command.get_program().to_string_lossy(), "cmd");
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args, vec!["/C", "echo ok"]);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(command.get_program().to_string_lossy(), "sh");
+            let args: Vec<_> = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(args, vec!["-c", "echo ok"]);
+        }
     }
 }
