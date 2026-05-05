@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 mod cmd_build;
 mod config;
 mod install;
+mod llm;
 mod skill;
 
 const DEFAULT_OUTPUT_DIR: &str = ".graphify";
@@ -46,8 +47,19 @@ enum Commands {
         path: String,
         #[arg(short, long, default_value = DEFAULT_OUTPUT_DIR)]
         output: String,
+        /// Disable new LLM calls; local extraction still runs and cached LLM output is preserved.
         #[arg(long)]
         no_llm: bool,
+        /// Enable external local LLM CLI extraction. Requires --llm-command or graphify.toml llm_command.
+        #[arg(long)]
+        llm: bool,
+        /// Shell command for local LLM extraction. Prompt is sent on stdin; JSON extraction must be printed to stdout.
+        #[arg(long)]
+        llm_command: Option<String>,
+        /// Stable provider/cache label for --llm-command output.
+        #[arg(long)]
+        llm_provider: Option<String>,
+        /// Only process code files, skip docs and papers.
         #[arg(long)]
         code_only: bool,
         /// Only re-extract new/modified files since last build
@@ -313,6 +325,9 @@ async fn main() -> Result<()> {
             path,
             output,
             no_llm,
+            llm,
+            llm_command,
+            llm_provider,
             code_only,
             update,
             format,
@@ -330,6 +345,23 @@ async fn main() -> Result<()> {
                 output
             };
             let effective_no_llm = no_llm || app_cfg.no_llm.unwrap_or(false);
+            let effective_llm_command = llm_command.or(app_cfg.llm_command);
+            let effective_llm_enabled = !effective_no_llm
+                && (llm || app_cfg.llm.unwrap_or(false) || effective_llm_command.is_some());
+            if effective_llm_enabled && effective_llm_command.is_none() {
+                anyhow::bail!("--llm requires --llm-command or graphify.toml llm_command");
+            }
+            let effective_llm_provider = llm_provider
+                .or(app_cfg.llm_provider)
+                .unwrap_or_else(|| "cli".to_string());
+            let effective_llm_cli = if effective_llm_enabled {
+                effective_llm_command.map(|command| llm::LlmCliConfig {
+                    provider: effective_llm_provider,
+                    command,
+                })
+            } else {
+                None
+            };
             let effective_code_only = code_only || app_cfg.code_only.unwrap_or(false);
             let effective_embed = embed || app_cfg.embed.unwrap_or(false);
             let effective_embedding_provider =
@@ -362,13 +394,13 @@ async fn main() -> Result<()> {
                 &effective_path,
                 &effective_output,
                 effective_no_llm,
+                effective_llm_cli.as_ref(),
                 effective_code_only,
                 update,
                 &effective_formats,
                 verb,
                 cli.jobs,
                 max_viz_nodes,
-                app_cfg.llm,
                 effective_embed,
                 &effective_embedding_provider,
                 &effective_embedding_model,
@@ -838,6 +870,12 @@ fn cmd_init() -> Result<()> {
 
 # Disable LLM-based semantic extraction
 # no_llm = false
+
+# Optional external local LLM CLI extraction. The command receives a prompt on stdin
+# and must write semantic JSON with entities/relationships to stdout.
+# llm = false
+# llm_command = "graphify-llm-codex --model gpt-5.4-mini"
+# llm_provider = "codex-cli"
 
 # Only process code files (skip docs/papers)
 # code_only = false

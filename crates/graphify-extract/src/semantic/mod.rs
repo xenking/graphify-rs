@@ -10,13 +10,16 @@ pub mod openai_compat;
 pub mod provider;
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result};
 use graphify_core::confidence::Confidence;
 use graphify_core::id::make_id;
 use graphify_core::model::{ExtractionResult, GraphEdge, GraphNode, NodeType};
 use serde::Deserialize;
+use tracing::debug;
 
 pub use provider::{AuthType, LLMConfigRaw, LLMProvider, LLMProviderConfig};
 
@@ -80,6 +83,71 @@ pub async fn extract_semantic(
     }
 }
 
+/// Extract semantic concepts by running a user-provided local LLM CLI command.
+///
+/// The command is executed through the platform shell with the extraction prompt
+/// written to stdin. It should write the same JSON shape as the provider paths:
+/// `{ "entities": [...], "relationships": [...] }`.
+pub fn extract_semantic_with_cli(
+    path: &Path,
+    content: &str,
+    file_type: &str,
+    command: &str,
+    existing: Option<&ExtractionResult>,
+) -> Result<ExtractionResult> {
+    let file_str = path.to_string_lossy();
+    let prompt = build_cli_prompt(content, file_type, existing);
+
+    debug!("running semantic extraction command for {}", file_str);
+
+    let mut child = platform_shell_command(command)
+        .env("GRAPHIFY_FILE", file_str.as_ref())
+        .env("GRAPHIFY_FILE_TYPE", file_type)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to start LLM command `{command}`"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(prompt.as_bytes())
+            .context("failed to write prompt to LLM command stdin")?;
+    }
+
+    let output = child
+        .wait_with_output()
+        .context("failed to wait for LLM command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "LLM command exited with status {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout).context("LLM command stdout was not UTF-8")?;
+    parse_semantic_response(&stdout, &file_str)
+}
+
+fn platform_shell_command(command: &str) -> Command {
+    #[cfg(windows)]
+    {
+        let mut child = Command::new("cmd");
+        child.arg("/C").arg(command);
+        child
+    }
+
+    #[cfg(not(windows))]
+    {
+        let mut child = Command::new("sh");
+        child.arg("-c").arg(command);
+        child
+    }
+}
+
 fn build_system_prompt(file_type: &str) -> String {
     format!(
         "You are an expert knowledge-graph extraction engine. \
@@ -113,7 +181,26 @@ fn build_user_prompt(content: &str, file_type: &str) -> String {
     format!("Extract all entities and relationships from this {file_type}:\n\n{truncated}{note}")
 }
 
-fn parse_semantic_response(text: &str, file_str: &str) -> Result<ExtractionResult> {
+fn build_cli_prompt(content: &str, file_type: &str, existing: Option<&ExtractionResult>) -> String {
+    let system = build_system_prompt(file_type);
+    let user = build_user_prompt(content, file_type);
+    let existing_json = existing
+        .and_then(|result| serde_json::to_string_pretty(result).ok())
+        .unwrap_or_else(|| "null".to_string());
+
+    format!(
+        "{system}
+
+         You are running as an external local CLI for graphify-rs.          Return ONLY the JSON object, with no markdown and no commentary.          If existing_extraction is not null, treat it as the previous graphify          extraction for this source file: update it for the current content,          preserve stable concise entity names where still valid, remove stale          relationships, and add newly discovered entities/relationships.
+
+         existing_extraction:
+{existing_json}
+
+         {user}"
+    )
+}
+
+pub fn parse_semantic_response(text: &str, file_str: &str) -> Result<ExtractionResult> {
     let json_str = extract_json_block(text);
 
     let output: SemanticOutput =
@@ -285,5 +372,27 @@ mod tests {
         let user = build_user_prompt("hello world", "document");
         assert!(user.contains("document"));
         assert!(user.contains("hello world"));
+    }
+
+    #[test]
+    fn cli_prompt_includes_existing_extraction() {
+        let existing = ExtractionResult {
+            nodes: vec![GraphNode {
+                id: "old".into(),
+                label: "Old".into(),
+                source_file: "doc.md".into(),
+                source_location: None,
+                node_type: NodeType::Concept,
+                community: None,
+                extra: HashMap::new(),
+            }],
+            edges: Vec::new(),
+            hyperedges: Vec::new(),
+        };
+
+        let prompt = build_cli_prompt("new content", "document", Some(&existing));
+        assert!(prompt.contains("existing_extraction"));
+        assert!(prompt.contains("\"label\": \"Old\""));
+        assert!(prompt.contains("Return ONLY the JSON object"));
     }
 }
