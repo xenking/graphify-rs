@@ -2,11 +2,14 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use graphify_core::graph::KnowledgeGraph;
+use graphify_core::{graph::KnowledgeGraph, model::GraphEdge};
 use serde_json::{Value, json};
 use tracing::debug;
 
-use crate::{SemanticState, bfs, graph_stats, score_nodes, subgraph_to_text};
+use crate::{
+    GraphifyOutputFormat, SemanticState, bfs, format_value, graph_stats, score_nodes,
+    subgraph_to_text,
+};
 
 pub(crate) fn tool_result_text(text: &str) -> Value {
     json!({
@@ -17,12 +20,6 @@ pub(crate) fn tool_result_text(text: &str) -> Value {
     })
 }
 
-pub(crate) fn tool_result_json<T: serde::Serialize>(value: &T) -> Value {
-    let text = serde_json::to_string_pretty(value)
-        .unwrap_or_else(|e| format!("{{\"error\": \"serialization failed: {}\"}}", e));
-    tool_result_text(&text)
-}
-
 pub(crate) fn tool_result_error(text: &str) -> Value {
     json!({
         "content": [{
@@ -30,6 +27,259 @@ pub(crate) fn tool_result_error(text: &str) -> Value {
             "text": text
         }],
         "isError": true
+    })
+}
+
+fn output_format(args: &Value) -> GraphifyOutputFormat {
+    GraphifyOutputFormat::parse(args["format"].as_str())
+}
+
+fn tool_result_value(value: &Value, format: GraphifyOutputFormat) -> Value {
+    match format_value(value, format) {
+        Ok(text) => tool_result_text(&text),
+        Err(err) => tool_result_error(&format!("failed to format output: {err}")),
+    }
+}
+
+fn node_context_value(graph: &KnowledgeGraph, node_id: &str) -> Option<Value> {
+    let node = graph.get_node(node_id)?;
+    Some(json!({
+        "id": node.id,
+        "label": node.label,
+        "type": node.node_type,
+        "file": node.source_file,
+        "location": node.source_location,
+        "community": node.community,
+        "degree": graph.degree(node_id),
+    }))
+}
+
+fn edge_context_value(all_edges: &[(&str, &str, &GraphEdge)], source: &str, target: &str) -> Value {
+    if let Some((_, _, edge)) = all_edges.iter().find(|(src, tgt, _)| {
+        (*src == source && *tgt == target) || (*src == target && *tgt == source)
+    }) {
+        json!({
+            "source": source,
+            "target": target,
+            "relation": edge.relation,
+            "confidence": edge.confidence,
+            "confidence_score": edge.confidence_score,
+            "file": edge.source_file,
+        })
+    } else {
+        json!({
+            "source": source,
+            "target": target,
+        })
+    }
+}
+
+fn subgraph_to_value(
+    graph: &KnowledgeGraph,
+    nodes: &[String],
+    edges: &[(String, String)],
+) -> Value {
+    let graph_edges = graph.edges_with_endpoints();
+    let node_values: Vec<Value> = nodes
+        .iter()
+        .filter_map(|node_id| node_context_value(graph, node_id))
+        .collect();
+    let edge_values: Vec<Value> = edges
+        .iter()
+        .map(|(source, target)| edge_context_value(&graph_edges, source, target))
+        .collect();
+
+    json!({
+        "kind": "query_graph",
+        "node_count": node_values.len(),
+        "edge_count": edge_values.len(),
+        "nodes": node_values,
+        "edges": edge_values,
+    })
+}
+
+fn output_row_limit(token_budget: usize, divisor: usize, min: usize, max: usize) -> usize {
+    (token_budget / divisor).clamp(min, max)
+}
+
+fn smart_summary_to_value(
+    graph: &KnowledgeGraph,
+    communities: &HashMap<usize, Vec<String>>,
+    level: crate::SummaryLevel,
+    token_budget: usize,
+) -> Value {
+    match level {
+        crate::SummaryLevel::Detailed => detailed_summary_value(graph, token_budget),
+        crate::SummaryLevel::Community => community_summary_value(graph, communities, token_budget),
+        crate::SummaryLevel::Architecture => architecture_summary_value(graph, token_budget),
+    }
+}
+
+fn detailed_summary_value(graph: &KnowledgeGraph, token_budget: usize) -> Value {
+    let mut nodes = graph.node_ids();
+    nodes.sort();
+    let node_limit = output_row_limit(token_budget, 20, 10, 500);
+    let edge_limit = output_row_limit(token_budget, 10, 20, 1000);
+    let all_edges = graph.edges_with_endpoints();
+    let edges: Vec<(String, String)> = all_edges
+        .iter()
+        .take(edge_limit)
+        .map(|(source, target, _)| ((*source).to_string(), (*target).to_string()))
+        .collect();
+
+    let mut value = subgraph_to_value(graph, &nodes[..nodes.len().min(node_limit)], &edges);
+    value["kind"] = json!("smart_summary_detailed");
+    value["total_nodes"] = json!(graph.node_count());
+    value["total_edges"] = json!(graph.edge_count());
+    value
+}
+
+fn community_summary_value(
+    graph: &KnowledgeGraph,
+    communities: &HashMap<usize, Vec<String>>,
+    token_budget: usize,
+) -> Value {
+    let mut sorted_cids: Vec<usize> = communities.keys().copied().collect();
+    sorted_cids.sort_unstable();
+    let community_limit = output_row_limit(token_budget, 10, 5, 250);
+
+    let community_values: Vec<Value> = sorted_cids
+        .iter()
+        .take(community_limit)
+        .filter_map(|cid| {
+            let members = communities.get(cid)?;
+            let (rep_id, rep_degree) = members
+                .iter()
+                .map(|id| (id.as_str(), graph.degree(id)))
+                .max_by_key(|(_, degree)| *degree)
+                .unwrap_or(("", 0));
+            let rep_label = graph
+                .get_node(rep_id)
+                .map(|node| node.label.as_str())
+                .unwrap_or(rep_id);
+            Some(json!({
+                "id": cid,
+                "node_count": members.len(),
+                "representative_id": rep_id,
+                "representative": rep_label,
+                "degree": rep_degree,
+            }))
+        })
+        .collect();
+
+    let mut node_cid: HashMap<&str, usize> = HashMap::new();
+    for (&cid, members) in communities {
+        for member in members {
+            node_cid.insert(member.as_str(), cid);
+        }
+    }
+
+    let mut cross_edges: HashMap<(usize, usize), usize> = HashMap::new();
+    for (source, target, _) in graph.edges_with_endpoints() {
+        let source_community = node_cid.get(source).copied().unwrap_or(usize::MAX);
+        let target_community = node_cid.get(target).copied().unwrap_or(usize::MAX);
+        if source_community != target_community
+            && source_community != usize::MAX
+            && target_community != usize::MAX
+        {
+            let key = if source_community < target_community {
+                (source_community, target_community)
+            } else {
+                (target_community, source_community)
+            };
+            *cross_edges.entry(key).or_default() += 1;
+        }
+    }
+    let mut sorted_cross: Vec<_> = cross_edges.into_iter().collect();
+    sorted_cross.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let dependency_limit = output_row_limit(token_budget, 40, 5, 50);
+    let dependencies: Vec<Value> = sorted_cross
+        .iter()
+        .take(dependency_limit)
+        .map(|((from, to), edges)| {
+            json!({
+                "from": from,
+                "to": to,
+                "edges": edges,
+            })
+        })
+        .collect();
+
+    json!({
+        "kind": "smart_summary_community",
+        "community_count": communities.len(),
+        "node_count": graph.node_count(),
+        "communities": community_values,
+        "dependencies": dependencies,
+    })
+}
+
+fn architecture_summary_value(graph: &KnowledgeGraph, token_budget: usize) -> Value {
+    let mut dir_nodes: HashMap<String, Vec<&str>> = HashMap::new();
+    for node in graph.nodes() {
+        let dir = std::path::Path::new(&node.source_file)
+            .parent()
+            .and_then(|path| path.to_str())
+            .unwrap_or(".")
+            .to_string();
+        dir_nodes.entry(dir).or_default().push(node.id.as_str());
+    }
+
+    let mut node_dir: HashMap<&str, &str> = HashMap::new();
+    for (dir, nodes) in &dir_nodes {
+        for &node_id in nodes {
+            node_dir.insert(node_id, dir.as_str());
+        }
+    }
+
+    let package_limit = output_row_limit(token_budget, 40, 5, 60);
+    let mut sorted_dirs: Vec<_> = dir_nodes.iter().collect();
+    sorted_dirs.sort_by_key(|(_, nodes)| std::cmp::Reverse(nodes.len()));
+    let packages: Vec<Value> = sorted_dirs
+        .iter()
+        .take(package_limit)
+        .map(|(path, nodes)| {
+            json!({
+                "path": path,
+                "node_count": nodes.len(),
+            })
+        })
+        .collect();
+
+    let mut dir_edges: HashMap<(&str, &str), usize> = HashMap::new();
+    for (source, target, _) in graph.edges_with_endpoints() {
+        let source_dir = node_dir.get(source).copied().unwrap_or("?");
+        let target_dir = node_dir.get(target).copied().unwrap_or("?");
+        if source_dir != target_dir {
+            let key = if source_dir < target_dir {
+                (source_dir, target_dir)
+            } else {
+                (target_dir, source_dir)
+            };
+            *dir_edges.entry(key).or_default() += 1;
+        }
+    }
+    let mut sorted_deps: Vec<_> = dir_edges.into_iter().collect();
+    sorted_deps.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+    let dependency_limit = output_row_limit(token_budget, 40, 5, 50);
+    let dependencies: Vec<Value> = sorted_deps
+        .iter()
+        .take(dependency_limit)
+        .map(|((from, to), edges)| {
+            json!({
+                "from": from,
+                "to": to,
+                "edges": edges,
+            })
+        })
+        .collect();
+
+    json!({
+        "kind": "smart_summary_architecture",
+        "package_count": dir_nodes.len(),
+        "node_count": graph.node_count(),
+        "packages": packages,
+        "dependencies": dependencies,
     })
 }
 
@@ -76,9 +326,12 @@ pub(crate) fn handle_query_graph(
     }
 
     let (nodes, edges) = bfs(graph, &start, 2);
-    let text = subgraph_to_text(graph, &nodes, &edges, budget);
+    let format = output_format(args);
+    if format != GraphifyOutputFormat::Text {
+        return tool_result_value(&subgraph_to_value(graph, &nodes, &edges), format);
+    }
 
-    tool_result_text(&text)
+    tool_result_text(&subgraph_to_text(graph, &nodes, &edges, budget))
 }
 
 fn dedupe_start_nodes(nodes: Vec<String>, limit: usize) -> Vec<String> {
@@ -115,7 +368,7 @@ pub(crate) fn handle_get_node(graph: &KnowledgeGraph, args: &Value) -> Value {
                 "degree": degree,
                 "neighbors": neighbors,
             });
-            tool_result_json(&result)
+            tool_result_value(&result, output_format(args))
         }
         None => tool_result_error(&format!("Node not found: {node_id}")),
     }
@@ -164,7 +417,7 @@ pub(crate) fn handle_get_neighbors(graph: &KnowledgeGraph, args: &Value) -> Valu
         "neighbors": neighbor_info,
     });
 
-    tool_result_json(&result)
+    tool_result_value(&result, output_format(args))
 }
 
 pub(crate) fn handle_get_community(graph: &KnowledgeGraph, args: &Value) -> Value {
@@ -204,7 +457,7 @@ pub(crate) fn handle_get_community(graph: &KnowledgeGraph, args: &Value) -> Valu
         "members": members,
     });
 
-    tool_result_json(&result)
+    tool_result_value(&result, output_format(args))
 }
 
 pub(crate) fn handle_god_nodes(graph: &KnowledgeGraph, args: &Value) -> Value {
@@ -231,12 +484,12 @@ pub(crate) fn handle_god_nodes(graph: &KnowledgeGraph, args: &Value) -> Value {
         "god_nodes": result,
     });
 
-    tool_result_json(&output)
+    tool_result_value(&output, output_format(args))
 }
 
-pub(crate) fn handle_graph_stats(graph: &KnowledgeGraph) -> Value {
+pub(crate) fn handle_graph_stats(graph: &KnowledgeGraph, args: &Value) -> Value {
     let stats = graph_stats(graph);
-    tool_result_json(&stats)
+    tool_result_value(&json!(stats), output_format(args))
 }
 
 pub(crate) fn handle_shortest_path(graph: &KnowledgeGraph, args: &Value) -> Value {
@@ -262,7 +515,7 @@ pub(crate) fn handle_shortest_path(graph: &KnowledgeGraph, args: &Value) -> Valu
             "path_length": 0,
             "path": [{"id": node.id, "label": node.label}],
         });
-        return tool_result_json(&result);
+        return tool_result_value(&result, output_format(args));
     }
 
     let mut visited: HashSet<String> = HashSet::new();
@@ -316,7 +569,7 @@ pub(crate) fn handle_shortest_path(graph: &KnowledgeGraph, args: &Value) -> Valu
         "path": path_nodes,
     });
 
-    tool_result_json(&result)
+    tool_result_value(&result, output_format(args))
 }
 
 pub(crate) fn handle_find_all_paths(graph: &KnowledgeGraph, args: &Value) -> Value {
@@ -361,7 +614,7 @@ pub(crate) fn handle_find_all_paths(graph: &KnowledgeGraph, args: &Value) -> Val
         "paths": paths_json,
     });
 
-    tool_result_json(&result)
+    tool_result_value(&result, output_format(args))
 }
 
 pub(crate) fn handle_weighted_path(graph: &KnowledgeGraph, args: &Value) -> Value {
@@ -410,7 +663,7 @@ pub(crate) fn handle_weighted_path(graph: &KnowledgeGraph, args: &Value) -> Valu
                 "path": path_nodes,
                 "edges": edges,
             });
-            tool_result_json(&result)
+            tool_result_value(&result, output_format(args))
         }
         None => tool_result_text(&format!(
             "No path found between {source} and {target} with min_confidence {min_confidence}"
@@ -451,7 +704,7 @@ pub(crate) fn handle_community_bridges(graph: &KnowledgeGraph, args: &Value) -> 
         "bridges": result,
     });
 
-    tool_result_json(&output)
+    tool_result_value(&output, output_format(args))
 }
 
 pub(crate) fn handle_graph_diff(graph: &KnowledgeGraph, args: &Value) -> Value {
@@ -471,13 +724,19 @@ pub(crate) fn handle_graph_diff(graph: &KnowledgeGraph, args: &Value) -> Value {
     };
 
     let diff = graphify_analyze::graph_diff(graph, &other_graph);
-    tool_result_json(&diff)
+    tool_result_value(
+        &serde_json::to_value(diff).unwrap_or_else(|_| json!({})),
+        output_format(args),
+    )
 }
 
 pub(crate) fn handle_pagerank(graph: &KnowledgeGraph, args: &Value) -> Value {
     let top_n = args["top_n"].as_u64().unwrap_or(10) as usize;
     let results = graphify_analyze::pagerank(graph, top_n, 0.85, 20);
-    tool_result_json(&results)
+    tool_result_value(
+        &serde_json::to_value(results).unwrap_or_else(|_| json!([])),
+        output_format(args),
+    )
 }
 
 pub(crate) fn handle_detect_cycles(graph: &KnowledgeGraph, args: &Value) -> Value {
@@ -486,7 +745,10 @@ pub(crate) fn handle_detect_cycles(graph: &KnowledgeGraph, args: &Value) -> Valu
     if cycles.is_empty() {
         tool_result_text("No dependency cycles detected.")
     } else {
-        tool_result_json(&cycles)
+        tool_result_value(
+            &serde_json::to_value(cycles).unwrap_or_else(|_| json!([])),
+            output_format(args),
+        )
     }
 }
 
@@ -506,8 +768,15 @@ pub(crate) fn handle_smart_summary(graph: &KnowledgeGraph, args: &Value) -> Valu
         communities.entry(cid).or_default().push(node.id.clone());
     }
 
-    let summary = crate::smart_summary(graph, &communities, level, budget);
-    tool_result_text(&summary)
+    let format = output_format(args);
+    if format != GraphifyOutputFormat::Text {
+        return tool_result_value(
+            &smart_summary_to_value(graph, &communities, level, budget),
+            format,
+        );
+    }
+
+    tool_result_text(&crate::smart_summary(graph, &communities, level, budget))
 }
 
 pub(crate) fn handle_find_similar(graph: &KnowledgeGraph, args: &Value) -> Value {
@@ -517,10 +786,12 @@ pub(crate) fn handle_find_similar(graph: &KnowledgeGraph, args: &Value) -> Value
     if pairs.is_empty() {
         tool_result_text("No structurally similar node pairs found.")
     } else {
-        tool_result_json(&pairs)
+        tool_result_value(
+            &serde_json::to_value(pairs).unwrap_or_else(|_| json!([])),
+            output_format(args),
+        )
     }
 }
-
 
 pub(crate) fn handle_semantic_query(
     graph: &KnowledgeGraph,
@@ -540,7 +811,10 @@ pub(crate) fn handle_semantic_query(
 
     match semantic.query(graph, question, top_n) {
         Ok(matches) if matches.is_empty() => tool_result_text("No semantic matches found."),
-        Ok(matches) => tool_result_json(&matches),
+        Ok(matches) => tool_result_value(
+            &serde_json::to_value(matches).unwrap_or_else(|_| json!([])),
+            output_format(args),
+        ),
         Err(err) => tool_result_error(&format!("{err}")),
     }
 }

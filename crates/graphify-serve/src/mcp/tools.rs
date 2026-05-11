@@ -18,6 +18,11 @@ pub(crate) fn tool_definitions() -> Value {
                         "type": "number",
                         "description": "Token budget for response (default: 2000)",
                         "default": 2000
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "Output format: text, json, or toon (default: text)",
+                        "enum": ["text", "json", "toon"]
                     }
                 },
                 "required": ["question"]
@@ -224,6 +229,11 @@ pub(crate) fn tool_definitions() -> Value {
                     "budget": {
                         "type": "number",
                         "description": "Token budget for summary (default: 2000)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "Output format: text, json, or toon (default: text)",
+                        "enum": ["text", "json", "toon"]
                     }
                 }
             }
@@ -241,6 +251,11 @@ pub(crate) fn tool_definitions() -> Value {
                     "top_n": {
                         "type": "number",
                         "description": "Number of ranked nodes to return (default: 10)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "description": "Output format: text, json, or toon (default: text)",
+                        "enum": ["text", "json", "toon"]
                     }
                 },
                 "required": ["question"]

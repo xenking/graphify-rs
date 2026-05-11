@@ -55,7 +55,7 @@ fn dispatch_tools_call(
         "get_neighbors" => handlers::handle_get_neighbors(graph, args),
         "get_community" => handlers::handle_get_community(graph, args),
         "god_nodes" => handlers::handle_god_nodes(graph, args),
-        "graph_stats" => handlers::handle_graph_stats(graph),
+        "graph_stats" => handlers::handle_graph_stats(graph, args),
         "shortest_path" => handlers::handle_shortest_path(graph, args),
         "find_all_paths" => handlers::handle_find_all_paths(graph, args),
         "weighted_path" => handlers::handle_weighted_path(graph, args),
@@ -302,6 +302,36 @@ mod tests {
     }
 
     #[test]
+    fn test_query_graph_toon_format() {
+        let g = test_graph();
+        let req = json!({
+            "jsonrpc": "2.0", "method": "tools/call", "id": 3,
+            "params": {
+                "name": "query_graph",
+                "arguments": {"question": "auth service", "format": "toon"}
+            }
+        });
+        let resp = dispatch(&g, &req).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("kind: query_graph"));
+        assert!(text.contains("nodes["));
+        assert!(text.contains("edges["));
+    }
+
+    #[test]
+    fn test_semantic_query_without_index_is_actionable_error() {
+        let g = test_graph();
+        let req = json!({
+            "jsonrpc": "2.0", "method": "tools/call", "id": 33,
+            "params": {"name": "semantic_query", "arguments": {"question": "auth service"}}
+        });
+        let resp = dispatch(&g, &req).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        assert!(text.contains("graphify-rs build --embed"));
+    }
+
+    #[test]
     fn test_get_node() {
         let g = test_graph();
         let req = json!({
@@ -312,6 +342,20 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("AuthService"));
         assert!(text.contains("\"degree\""));
+    }
+
+    #[test]
+    fn test_god_nodes_toon_format() {
+        let g = test_graph();
+        let req = json!({
+            "jsonrpc": "2.0", "method": "tools/call", "id": 40,
+            "params": {"name": "god_nodes", "arguments": {"top_n": 2, "format": "toon"}}
+        });
+        let resp = dispatch(&g, &req).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("god_nodes[2"));
+        assert!(text.contains("rank"));
+        assert!(!text.trim_start().starts_with('{'));
     }
 
     #[test]
