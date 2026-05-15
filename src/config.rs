@@ -85,7 +85,10 @@ llm_provider = "test-cli"
         );
         assert_eq!(cfg.embed, Some(true));
         assert_eq!(cfg.embedding_provider.as_deref(), Some("model2vec"));
-        assert_eq!(cfg.embedding_model.as_deref(), Some("minishlab/potion-code-16M"));
+        assert_eq!(
+            cfg.embedding_model.as_deref(),
+            Some("minishlab/potion-code-16M")
+        );
         assert_eq!(cfg.anthropic_semantic, Some(false));
         assert_eq!(cfg.llm, Some(true));
         assert_eq!(cfg.llm_command.as_deref(), Some("cat"));

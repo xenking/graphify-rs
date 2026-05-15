@@ -375,13 +375,12 @@ async fn main() -> Result<()> {
                 } else {
                     embedding_provider.clone()
                 };
-            let effective_embedding_model =
-                embedding_model.or(app_cfg.embedding_model).unwrap_or_else(|| {
-                    match effective_embedding_provider.as_str() {
-                        "ollama" => graphify_embed::DEFAULT_OLLAMA_MODEL.to_string(),
-                        "voyage" | "voyageai" => graphify_embed::DEFAULT_VOYAGE_MODEL.to_string(),
-                        _ => graphify_embed::DEFAULT_MODEL.to_string(),
-                    }
+            let effective_embedding_model = embedding_model
+                .or(app_cfg.embedding_model)
+                .unwrap_or_else(|| match effective_embedding_provider.as_str() {
+                    "ollama" => graphify_embed::DEFAULT_OLLAMA_MODEL.to_string(),
+                    "voyage" | "voyageai" => graphify_embed::DEFAULT_VOYAGE_MODEL.to_string(),
+                    _ => graphify_embed::DEFAULT_MODEL.to_string(),
                 });
             let effective_anthropic_semantic =
                 anthropic_semantic || app_cfg.anthropic_semantic.unwrap_or(false);
@@ -586,7 +585,6 @@ fn ensure_local_output_excluded(project_root: &Path, output_dir: &Path) {
     output.push('\n');
     let _ = std::fs::write(exclude_path, output);
 }
-
 
 /// Query the knowledge graph
 fn cmd_query(

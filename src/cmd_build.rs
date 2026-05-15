@@ -573,7 +573,12 @@ async fn run_anthropic_semantic_extraction(
     ) {
         Ok(config) => config,
         Err(err) => {
-            verbose_print!(verb, "    {} invalid Anthropic config: {}", "⚠".yellow(), err);
+            verbose_print!(
+                verb,
+                "    {} invalid Anthropic config: {}",
+                "⚠".yellow(),
+                err
+            );
             return results;
         }
     };
@@ -643,8 +648,10 @@ async fn run_anthropic_semantic_extraction(
                     sem_result.nodes.len(),
                     sem_result.edges.len()
                 );
-                let _ = llm::save_legacy_entry(&doc_p, &root_p, &cache_dir, "anthropic", &sem_result);
-                let _ = graphify_cache::save_cached_to(&doc_p, &sem_result, &root_p, &legacy_cache_dir);
+                let _ =
+                    llm::save_legacy_entry(&doc_p, &root_p, &cache_dir, "anthropic", &sem_result);
+                let _ =
+                    graphify_cache::save_cached_to(&doc_p, &sem_result, &root_p, &legacy_cache_dir);
                 results.push(sem_result);
             }
             Ok(Err(e)) => {
@@ -819,7 +826,8 @@ fn step_export(
     }
 
     if should_export("context") {
-        let context = graphify_export::generate_llm_context(graph, communities, community_labels, root);
+        let context =
+            graphify_export::generate_llm_context(graph, communities, community_labels, root);
         let context_path = graphify_export::export_llm_context(&context, output_dir)?;
         info_print!(
             verb,

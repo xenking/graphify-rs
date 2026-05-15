@@ -440,7 +440,7 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
             None => continue,
         };
 
-// Create uses edges: each entity in the importing file → each entity in the target module.
+        // Create uses edges: each entity in the importing file → each entity in the target module.
         // Very large imports are collapsed to file-level edges to avoid explosive graph growth.
         if local_entities.len().saturating_mul(target_entities.len())
             > MAX_IMPORT_ENTITY_EDGE_EXPANSION
@@ -817,4 +817,3 @@ fn resolve_dart_import<'a>(
 
 #[cfg(test)]
 mod tests;
-

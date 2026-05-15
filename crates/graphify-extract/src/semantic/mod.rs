@@ -148,7 +148,6 @@ fn platform_shell_command(command: &str) -> Command {
     }
 }
 
-
 fn build_system_prompt(file_type: &str) -> String {
     format!(
         "You are an expert knowledge-graph extraction engine. \

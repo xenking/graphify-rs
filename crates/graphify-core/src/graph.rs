@@ -224,7 +224,6 @@ impl KnowledgeGraph {
 
     /// Deserialize from the NetworkX `node_link_data` JSON format.
     pub fn from_node_link_json(value: &Value) -> Result<Self> {
-
         let nodes = value
             .get("nodes")
             .and_then(|v| v.as_array())
@@ -240,7 +239,6 @@ impl KnowledgeGraph {
             .map(|v| serde_json::from_value(v.clone()).map_err(GraphifyError::SerializationError))
             .collect::<Result<Vec<GraphEdge>>>()?;
         Self::from_node_link_parts(nodes, links)
-
     }
 
     /// Deserialize a NetworkX `node_link_data` JSON graph from a reader.
