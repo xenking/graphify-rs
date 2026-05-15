@@ -309,9 +309,12 @@ impl SemanticEngine {
         let index = read_index(index_path)?;
         let graph_fingerprint = graph_fingerprint(graph);
         validate_index_for_graph(&index, &graph_fingerprint, &index.model)?;
+        let (provider, model) = split_model_spec(&index.model);
+        let encoder = build_encoder(provider, model)
+            .with_context(|| format!("load semantic encoder {}", index.model))?;
         Ok(Self {
             index,
-            encoder: Mutex::new(None),
+            encoder: Mutex::new(Some(encoder)),
         })
     }
 
@@ -1475,7 +1478,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_engine_loads_index_without_eager_encoder() {
+    fn semantic_engine_rejects_unavailable_encoder_at_load() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(DEFAULT_INDEX_FILE);
         let graph = make_graph();
@@ -1492,9 +1495,11 @@ mod tests {
         };
         write_index(&index, &path).unwrap();
 
-        let engine = SemanticEngine::load_for_graph(&path, &graph).unwrap();
+        let result = SemanticEngine::load_for_graph(&path, &graph);
 
-        assert_eq!(engine.model(), "model2vec:__definitely_missing_model__");
-        assert_eq!(engine.node_count(), 1);
+        match result {
+            Ok(_) => panic!("unavailable encoder should fail during load"),
+            Err(err) => assert!(format!("{err:#}").contains("load semantic encoder")),
+        }
     }
 }

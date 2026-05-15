@@ -943,7 +943,7 @@ mod tests {
         let index_path = graphify_embed::default_index_path_for_graph(&graph_path);
         let index = graphify_embed::SemanticIndex {
             version: 1,
-            model: graphify_embed::DEFAULT_MODEL.to_string(),
+            model: "ollama:__graphify_test_missing_model__".to_string(),
             graph_fingerprint: graphify_embed::graph_fingerprint(&graph),
             dim: 1,
             nodes: Vec::new(),
