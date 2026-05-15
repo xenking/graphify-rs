@@ -62,6 +62,7 @@ fn ip_is_private(ip: &std::net::IpAddr) -> bool {
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
+                || v4.octets()[0] == 0
                 || is_in_range(
                     v4,
                     &std::net::Ipv4Addr::new(100, 64, 0, 0),
@@ -250,6 +251,17 @@ mod tests {
     fn test_reject_zero_ip() {
         let result = validate_url("http://0.0.0.0/");
         assert!(matches!(result, Err(SecurityError::PrivateIp(_))));
+    }
+
+    #[test]
+    fn test_reject_zero_network() {
+        for url in ["http://0.0.0.1/", "http://0.1/"] {
+            let result = validate_url(url);
+            assert!(
+                matches!(result, Err(SecurityError::PrivateIp(_))),
+                "{url} must be rejected"
+            );
+        }
     }
 
     #[test]

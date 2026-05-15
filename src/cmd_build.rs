@@ -876,17 +876,29 @@ fn step_export(
     }
 
     let manifest_path = output_dir.join(".graphify_manifest.json");
-    let manifest = graphify_detect::Manifest {
-        files: detection
-            .files
-            .iter()
-            .flat_map(|(ft, paths)| paths.iter().map(move |p| (p.clone(), *ft)))
-            .collect(),
-        hashes: HashMap::new(),
-    };
+    let manifest = manifest_from_detection(Path::new(root), detection);
     graphify_detect::save_manifest(&manifest_path, &manifest)?;
 
     Ok(())
+}
+
+fn manifest_from_detection(
+    root: &Path,
+    detection: &graphify_detect::DetectResult,
+) -> graphify_detect::Manifest {
+    let files: HashMap<String, graphify_detect::FileType> = detection
+        .files
+        .iter()
+        .flat_map(|(ft, paths)| paths.iter().map(move |p| (p.clone(), *ft)))
+        .collect();
+    let hashes = files
+        .keys()
+        .filter_map(|rel| {
+            graphify_cache::file_hash(&root.join(rel)).map(|hash| (rel.clone(), hash))
+        })
+        .collect();
+
+    graphify_detect::Manifest { files, hashes }
 }
 
 #[cfg(test)]
@@ -932,6 +944,35 @@ mod tests {
         assert_eq!(
             results[0].nodes[0].extra["llm_stale_preserved"],
             serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn manifest_from_detection_records_current_hashes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let file = root.join("src.rs");
+        std::fs::write(&file, "fn main() {}").expect("write source");
+
+        let detection = graphify_detect::DetectResult {
+            files: HashMap::from([(graphify_detect::FileType::Code, vec!["src.rs".into()])]),
+            total_files: 1,
+            total_words: 3,
+            needs_graph: false,
+            warning: None,
+            skipped_sensitive: Vec::new(),
+            graphifyignore_patterns: 0,
+        };
+
+        let manifest = manifest_from_detection(root, &detection);
+
+        assert_eq!(
+            manifest.files.get("src.rs"),
+            Some(&graphify_detect::FileType::Code)
+        );
+        assert_eq!(
+            manifest.hashes.get("src.rs"),
+            graphify_cache::file_hash(&file).as_ref()
         );
     }
 }
