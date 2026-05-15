@@ -177,9 +177,7 @@ pub fn extract(paths: &[PathBuf]) -> ExtractionResult {
         combined.hyperedges.extend(r.hyperedges);
     }
 
-    resolve_python_imports(&mut combined);
-
-    resolve_cross_file_imports(&mut combined);
+    resolve_import_relationships(&mut combined);
 
     info!(
         "extraction complete: {} nodes, {} edges",
@@ -188,6 +186,16 @@ pub fn extract(paths: &[PathBuf]) -> ExtractionResult {
     );
 
     combined
+}
+
+/// Resolve import edges into cross-file relationship edges after multiple
+/// extraction results have been merged.
+///
+/// This is intentionally idempotent so callers can run it both after direct
+/// multi-file extraction and after cache-backed per-file extraction.
+pub fn resolve_import_relationships(result: &mut ExtractionResult) {
+    resolve_python_imports(result);
+    resolve_cross_file_imports(result);
 }
 
 /// Resolve Python `import` / `from ... import` edges to actual module/function
@@ -228,6 +236,12 @@ fn resolve_python_imports(result: &mut ExtractionResult) {
     }
 
     let mut star_expansions: Vec<GraphEdge> = Vec::new();
+    let mut seen_star_uses: HashSet<(String, String)> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.relation == "uses")
+        .map(|edge| (edge.source.clone(), edge.target.clone()))
+        .collect();
 
     for edge in &mut result.edges {
         if edge.relation == "imports" {
@@ -242,6 +256,9 @@ fn resolve_python_imports(result: &mut ExtractionResult) {
                 let module_name = import_label.trim_end_matches(".*").trim_end_matches(" *");
                 if let Some(entity_ids) = stem_to_entity_ids.get(module_name) {
                     for target_id in entity_ids {
+                        if !seen_star_uses.insert((edge.source.clone(), target_id.clone())) {
+                            continue;
+                        }
                         star_expansions.push(GraphEdge {
                             source: edge.source.clone(),
                             target: target_id.clone(),
@@ -284,6 +301,8 @@ fn resolve_python_imports(result: &mut ExtractionResult) {
 /// stem and then creates `uses` edges from entities in the importing file to
 /// entities defined in the target module. This turns file-level import edges
 /// into entity-level relationship edges.
+const MAX_IMPORT_ENTITY_EDGE_EXPANSION: usize = 500;
+
 fn resolve_cross_file_imports(result: &mut ExtractionResult) {
     let mut id_to_label: HashMap<String, String> = HashMap::new();
     let mut stem_to_entities: HashMap<String, Vec<(String, String, NodeType)>> = HashMap::new();
@@ -299,12 +318,14 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
         .collect();
 
     let mut source_file_entities: HashMap<String, Vec<String>> = HashMap::new();
+    let mut entity_to_file_id: HashMap<String, String> = HashMap::new();
     for edge in &result.edges {
         if edge.relation == "defines" {
             source_file_entities
                 .entry(edge.source_file.clone())
                 .or_default()
                 .push(edge.target.clone());
+            entity_to_file_id.insert(edge.target.clone(), edge.source.clone());
         }
     }
 
@@ -354,7 +375,12 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
     }
 
     let mut new_edges: Vec<GraphEdge> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<(String, String)> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.relation == "uses")
+        .map(|edge| (edge.source.clone(), edge.target.clone()))
+        .collect();
 
     for edge in &result.edges {
         if edge.relation != "imports" {
@@ -413,6 +439,38 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
             Some(ids) => ids,
             None => continue,
         };
+
+// Create uses edges: each entity in the importing file → each entity in the target module.
+        // Very large imports are collapsed to file-level edges to avoid explosive graph growth.
+        if local_entities.len().saturating_mul(target_entities.len())
+            > MAX_IMPORT_ENTITY_EDGE_EXPANSION
+        {
+            for (_, target_id, _) in &target_entities {
+                let Some(target_file_id) = entity_to_file_id.get(target_id) else {
+                    continue;
+                };
+                if &edge.source == target_file_id {
+                    continue;
+                }
+                let key = (edge.source.clone(), target_file_id.clone());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.insert(key);
+                new_edges.push(GraphEdge {
+                    source: edge.source.clone(),
+                    target: target_file_id.clone(),
+                    relation: "uses".to_string(),
+                    confidence: Confidence::Inferred,
+                    confidence_score: 0.8,
+                    source_file: source_file.clone(),
+                    source_location: None,
+                    weight: 0.8,
+                    extra: Default::default(),
+                });
+            }
+            continue;
+        }
 
         let target_by_label: HashMap<&str, &String> = target_entities
             .iter()
@@ -759,3 +817,4 @@ fn resolve_dart_import<'a>(
 
 #[cfg(test)]
 mod tests;
+

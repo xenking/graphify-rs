@@ -16,7 +16,7 @@ pub(crate) fn tool_definitions() -> Value {
                     },
                     "budget": {
                         "type": "number",
-                        "description": "Token budget for response (default: 2000)",
+                        "description": "Token budget for response and structured row caps (default: 2000)",
                         "default": 2000
                     },
                     "format": {

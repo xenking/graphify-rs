@@ -190,6 +190,128 @@ fn go_cross_file_creates_uses_edges() {
 }
 
 #[test]
+fn resolve_import_relationships_is_idempotent() {
+    let mut result = ExtractionResult {
+        nodes: vec![
+            make_test_node("file_main", "main", "cmd/main.go", NodeType::File),
+            make_test_node("server", "Server", "cmd/main.go", NodeType::Struct),
+            make_test_node(
+                "import_utils",
+                "myproject/pkg/utils",
+                "cmd/main.go",
+                NodeType::Package,
+            ),
+            make_test_node(
+                "file_helpers",
+                "helpers",
+                "pkg/utils/helpers.go",
+                NodeType::File,
+            ),
+            make_test_node(
+                "parse_config",
+                "ParseConfig",
+                "pkg/utils/helpers.go",
+                NodeType::Function,
+            ),
+        ],
+        edges: vec![
+            make_test_edge("file_main", "server", "defines", "cmd/main.go"),
+            make_test_edge("file_main", "import_utils", "imports", "cmd/main.go"),
+            make_test_edge(
+                "file_helpers",
+                "parse_config",
+                "defines",
+                "pkg/utils/helpers.go",
+            ),
+        ],
+        hyperedges: vec![],
+    };
+
+    resolve_import_relationships(&mut result);
+    resolve_import_relationships(&mut result);
+
+    let uses_edges = result
+        .edges
+        .iter()
+        .filter(|edge| {
+            edge.relation == "uses" && edge.source == "server" && edge.target == "parse_config"
+        })
+        .count();
+    assert_eq!(uses_edges, 1);
+}
+
+#[test]
+fn cross_file_import_resolution_caps_large_entity_expansions_at_file_edges() {
+    let mut nodes = vec![
+        make_test_node("file_main", "main", "cmd/main.go", NodeType::File),
+        make_test_node(
+            "import_utils",
+            "myproject/pkg/utils",
+            "cmd/main.go",
+            NodeType::Package,
+        ),
+        make_test_node(
+            "file_utils",
+            "utils",
+            "pkg/utils/helpers.go",
+            NodeType::File,
+        ),
+    ];
+    let mut edges = vec![make_test_edge(
+        "file_main",
+        "import_utils",
+        "imports",
+        "cmd/main.go",
+    )];
+    for idx in 0..30 {
+        let local = format!("local_{idx}");
+        nodes.push(make_test_node(
+            &local,
+            &format!("Local{idx}"),
+            "cmd/main.go",
+            NodeType::Function,
+        ));
+        edges.push(make_test_edge(
+            "file_main",
+            &local,
+            "defines",
+            "cmd/main.go",
+        ));
+
+        let target = format!("target_{idx}");
+        nodes.push(make_test_node(
+            &target,
+            &format!("Target{idx}"),
+            "pkg/utils/helpers.go",
+            NodeType::Function,
+        ));
+        edges.push(make_test_edge(
+            "file_utils",
+            &target,
+            "defines",
+            "pkg/utils/helpers.go",
+        ));
+    }
+
+    let mut result = ExtractionResult {
+        nodes,
+        edges,
+        hyperedges: vec![],
+    };
+    resolve_cross_file_imports(&mut result);
+
+    let uses_edges: Vec<_> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.relation == "uses")
+        .collect();
+
+    assert_eq!(uses_edges.len(), 1);
+    assert_eq!(uses_edges[0].source, "file_main");
+    assert_eq!(uses_edges[0].target, "file_utils");
+}
+
+#[test]
 fn rust_cross_file_creates_uses_edges() {
     // File: src/main.rs defines App, imports "crate::model"
     // File: src/model.rs defines Config, Database

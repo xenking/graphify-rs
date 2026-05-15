@@ -319,6 +319,84 @@ mod tests {
     }
 
     #[test]
+    fn query_graph_json_respects_budget_and_caps_hub_traversal() {
+        let mut g = KnowledgeGraph::new();
+        g.add_node(make_node("target", "TargetRemoteHID", Some(0)))
+            .unwrap();
+        g.add_node(make_node("hub", "FeatureReportsInterface", Some(0)))
+            .unwrap();
+        g.add_edge(make_edge("target", "hub")).unwrap();
+
+        for idx in 0..80 {
+            let id = format!("leaf_{idx}");
+            let label = format!("FeatureReportLeaf{idx}");
+            g.add_node(make_node(&id, &label, Some(1))).unwrap();
+            g.add_edge(make_edge("hub", &id)).unwrap();
+        }
+
+        let req = json!({
+            "jsonrpc": "2.0", "method": "tools/call", "id": 31,
+            "params": {
+                "name": "query_graph",
+                "arguments": {
+                    "question": "where TargetRemoteHID feature reports interface flow wire",
+                    "budget": 500,
+                    "format": "json"
+                }
+            }
+        });
+        let resp = dispatch(&g, &req).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let value: Value = serde_json::from_str(text).unwrap();
+
+        assert_eq!(value["kind"], "query_graph");
+        assert_eq!(value["truncated"], true);
+        assert!(value["nodes"].as_array().unwrap().len() <= 24);
+        assert!(value["edges"].as_array().unwrap().len() <= 32);
+        assert!(text.len() < 8_000);
+    }
+
+    #[test]
+    fn query_graph_toon_marks_truncation_without_dumping_full_hub_neighborhood() {
+        let mut g = KnowledgeGraph::new();
+        g.add_node(make_node("control_hid", "control_hid()", Some(0)))
+            .unwrap();
+        g.add_node(make_node("remote_hid", "RemoteHID", Some(0)))
+            .unwrap();
+        g.add_node(make_node("hub", "FeatureReportsInterface", Some(0)))
+            .unwrap();
+        g.add_edge(make_edge("control_hid", "hub")).unwrap();
+        g.add_edge(make_edge("hub", "remote_hid")).unwrap();
+
+        for idx in 0..100 {
+            let id = format!("generic_{idx}");
+            let label = format!("FeatureReportInterface{idx}");
+            g.add_node(make_node(&id, &label, Some(1))).unwrap();
+            g.add_edge(make_edge("hub", &id)).unwrap();
+        }
+
+        let req = json!({
+            "jsonrpc": "2.0", "method": "tools/call", "id": 32,
+            "params": {
+                "name": "query_graph",
+                "arguments": {
+                    "question": "Steam Controller Triton webOS native HID feature reports interface queue flow where control_hid wires into RemoteHID",
+                    "budget": 500,
+                    "format": "toon"
+                }
+            }
+        });
+        let resp = dispatch(&g, &req).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+
+        assert!(text.contains("truncated: true"));
+        assert!(text.contains("control_hid()"));
+        assert!(text.contains("RemoteHID"));
+        assert!(text.len() < 8_000);
+        assert!(!text.contains("FeatureReportInterface99"));
+    }
+
+    #[test]
     fn test_semantic_query_without_index_is_actionable_error() {
         let g = test_graph();
         let req = json!({
