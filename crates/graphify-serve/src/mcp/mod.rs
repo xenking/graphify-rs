@@ -214,6 +214,7 @@ mod tests {
     use super::*;
     use graphify_core::confidence::Confidence;
     use graphify_core::model::{GraphEdge, GraphNode, NodeType};
+    use graphify_embed::{IndexedNode, SemanticIndex, write_index};
     use std::collections::HashMap;
 
     fn make_node(id: &str, label: &str, community: Option<usize>) -> GraphNode {
@@ -407,6 +408,43 @@ mod tests {
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert_eq!(resp["result"]["isError"], true);
         assert!(text.contains("graphify-rs build --embed"));
+    }
+
+    #[test]
+    fn query_graph_reports_semantic_fallback_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let index_path = graphify_embed::default_index_path_for_graph(&graph_path);
+        let g = test_graph();
+        write_index(
+            &SemanticIndex {
+                version: 1,
+                model: "model2vec:__definitely_missing_model__".into(),
+                graph_fingerprint: "stale".into(),
+                dim: 1,
+                nodes: vec![IndexedNode {
+                    node_id: "auth".into(),
+                    text: "auth service".into(),
+                    embedding: vec![1.0],
+                }],
+            },
+            &index_path,
+        )
+        .unwrap();
+        let semantic = SemanticState::load_for_graph_path(&graph_path, &g)
+            .unwrap()
+            .unwrap();
+        let req = json!({
+            "jsonrpc": "2.0", "method": "tools/call", "id": 34,
+            "params": {"name": "query_graph", "arguments": {"question": "auth service"}}
+        });
+
+        let resp = handle_jsonrpc_with_semantic(&g, Some(&semantic), &req).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+
+        assert!(text.contains("semantic query unavailable"));
+        assert!(text.contains("falling back to lexical query"));
+        assert!(text.contains("AuthService"));
     }
 
     #[test]

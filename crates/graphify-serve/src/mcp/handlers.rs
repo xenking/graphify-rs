@@ -109,9 +109,9 @@ struct QueryLimits {
 impl QueryLimits {
     fn for_budget(token_budget: usize) -> Self {
         Self {
-            max_nodes: output_row_limit(token_budget, 25, 8, 48),
-            max_edges: output_row_limit(token_budget, 16, 12, 96),
-            max_neighbors_per_node: output_row_limit(token_budget, 80, 4, 14),
+            max_nodes: output_row_limit(token_budget, 40, 6, 36),
+            max_edges: output_row_limit(token_budget, 25, 8, 64),
+            max_neighbors_per_node: output_row_limit(token_budget, 120, 3, 10),
             hub_degree_cutoff: output_row_limit(token_budget, 12, 24, 160),
         }
     }
@@ -247,6 +247,7 @@ fn query_node_score(graph: &KnowledgeGraph, node_id: &str, terms: &[String]) -> 
         | graphify_core::model::NodeType::Interface
         | graphify_core::model::NodeType::Enum
         | graphify_core::model::NodeType::Trait => 1.1,
+        graphify_core::model::NodeType::File | graphify_core::model::NodeType::Module => 0.45,
         graphify_core::model::NodeType::Variable
         | graphify_core::model::NodeType::Constant
         | graphify_core::model::NodeType::Package => 0.65,
@@ -256,11 +257,27 @@ fn query_node_score(graph: &KnowledgeGraph, node_id: &str, terms: &[String]) -> 
     (score * quality * node_kind) - hub_penalty
 }
 
+fn query_seed_candidate(graph: &KnowledgeGraph, node_id: &str, terms: &[String]) -> bool {
+    let Some(node) = graph.get_node(node_id) else {
+        return false;
+    };
+    if query_node_score(graph, node_id, terms) > 0.0 {
+        return true;
+    }
+    !matches!(
+        node.node_type,
+        graphify_core::model::NodeType::File
+            | graphify_core::model::NodeType::Module
+            | graphify_core::model::NodeType::Package
+    )
+}
+
 fn query_context_to_value(
     graph: &KnowledgeGraph,
     context: &QueryContext,
     start: &[String],
     terms: &[String],
+    warnings: &[String],
 ) -> Value {
     let mut value = subgraph_to_value(graph, &context.nodes, &context.edges);
     value["truncated"] = json!(context.truncated);
@@ -268,6 +285,9 @@ fn query_context_to_value(
     value["omitted_edges"] = json!(context.omitted_edges);
     value["seed_count"] = json!(start.len());
     value["terms"] = json!(terms);
+    if !warnings.is_empty() {
+        value["warnings"] = json!(warnings);
+    }
     value
 }
 
@@ -475,15 +495,30 @@ pub(crate) fn handle_query_graph(
     }
 
     let scored = score_nodes(graph, &terms);
-    let mut start: Vec<String> = scored.iter().take(6).map(|(_, id)| id.clone()).collect();
+    let mut start: Vec<String> = scored
+        .iter()
+        .map(|(_, id)| id)
+        .filter(|id| query_seed_candidate(graph, id, &terms))
+        .take(6)
+        .cloned()
+        .collect();
 
+    let mut warnings = Vec::new();
     if let Some(semantic) = semantic {
         match semantic.query(graph, question, 8) {
             Ok(matches) => {
-                start.extend(matches.into_iter().map(|m| m.node_id));
+                start.extend(
+                    matches
+                        .into_iter()
+                        .map(|m| m.node_id)
+                        .filter(|id| query_seed_candidate(graph, id, &terms)),
+                );
             }
             Err(err) => {
                 debug!("semantic query unavailable, falling back to lexical query: {err}");
+                warnings.push(format!(
+                    "semantic query unavailable; falling back to lexical query: {err}"
+                ));
             }
         }
     }
@@ -498,12 +533,22 @@ pub(crate) fn handle_query_graph(
     let format = output_format(args);
     if format != GraphifyOutputFormat::Text {
         return tool_result_value(
-            &query_context_to_value(graph, &context, &start, &terms),
+            &query_context_to_value(graph, &context, &start, &terms, &warnings),
             format,
         );
     }
 
-    let mut text = subgraph_to_text(graph, &context.nodes, &context.edges, budget);
+    let mut text = String::new();
+    for warning in &warnings {
+        text.push_str(warning);
+        text.push('\n');
+    }
+    text.push_str(&subgraph_to_text(
+        graph,
+        &context.nodes,
+        &context.edges,
+        budget,
+    ));
     if context.truncated {
         text.push_str(&format!(
             "\n... (bounded graph context: omitted {} node(s), {} edge(s))\n",
