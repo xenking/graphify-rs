@@ -876,29 +876,10 @@ fn step_export(
     }
 
     let manifest_path = output_dir.join(".graphify_manifest.json");
-    let manifest = manifest_from_detection(Path::new(root), detection);
+    let manifest = graphify_detect::manifest_from_detection(Path::new(root), detection);
     graphify_detect::save_manifest(&manifest_path, &manifest)?;
 
     Ok(())
-}
-
-fn manifest_from_detection(
-    root: &Path,
-    detection: &graphify_detect::DetectResult,
-) -> graphify_detect::Manifest {
-    let files: HashMap<String, graphify_detect::FileType> = detection
-        .files
-        .iter()
-        .flat_map(|(ft, paths)| paths.iter().map(move |p| (p.clone(), *ft)))
-        .collect();
-    let hashes = files
-        .keys()
-        .filter_map(|rel| {
-            graphify_cache::file_hash(&root.join(rel)).map(|hash| (rel.clone(), hash))
-        })
-        .collect();
-
-    graphify_detect::Manifest { files, hashes }
 }
 
 #[cfg(test)]
@@ -964,7 +945,7 @@ mod tests {
             graphifyignore_patterns: 0,
         };
 
-        let manifest = manifest_from_detection(root, &detection);
+        let manifest = graphify_detect::manifest_from_detection(root, &detection);
 
         assert_eq!(
             manifest.files.get("src.rs"),

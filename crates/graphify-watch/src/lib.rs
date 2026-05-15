@@ -216,14 +216,7 @@ fn rebuild(
     }
 
     let manifest_path = output_dir.join(".graphify_manifest.json");
-    let manifest = graphify_detect::Manifest {
-        files: detection
-            .files
-            .iter()
-            .flat_map(|(ft, paths)| paths.iter().map(move |p| (p.clone(), *ft)))
-            .collect(),
-        hashes: HashMap::new(),
-    };
+    let manifest = graphify_detect::manifest_from_detection(root, &detection);
     let _ = graphify_detect::save_manifest(&manifest_path, &manifest);
 
     info!("rebuild: done");
@@ -391,6 +384,17 @@ mod tests {
         assert!(output.path().join("graph.json").exists());
         assert!(output.path().join("graph.html").exists());
         assert!(output.path().join("GRAPH_REPORT.md").exists());
+        let manifest =
+            graphify_detect::load_manifest(&output.path().join(".graphify_manifest.json"))
+                .expect("manifest should be saved");
+        assert_eq!(
+            manifest.hashes.get("src/main.rs"),
+            graphify_cache::file_hash(&src.join("main.rs")).as_ref()
+        );
+        assert_eq!(
+            manifest.hashes.get("src/lib.rs"),
+            graphify_cache::file_hash(&src.join("lib.rs")).as_ref()
+        );
     }
 
     #[test]

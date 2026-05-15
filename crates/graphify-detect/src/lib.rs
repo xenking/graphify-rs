@@ -83,6 +83,23 @@ pub fn save_manifest(path: &Path, manifest: &Manifest) -> Result<(), DetectError
     Ok(())
 }
 
+/// Build a manifest from a detection result and current file content hashes.
+pub fn manifest_from_detection(root: &Path, detection: &DetectResult) -> Manifest {
+    let files: HashMap<String, FileType> = detection
+        .files
+        .iter()
+        .flat_map(|(ft, paths)| paths.iter().map(move |p| (p.clone(), *ft)))
+        .collect();
+    let hashes = files
+        .keys()
+        .filter_map(|rel| {
+            graphify_cache::file_hash(&root.join(rel)).map(|hash| (rel.clone(), hash))
+        })
+        .collect();
+
+    Manifest { files, hashes }
+}
+
 /// Walk `root` and return a [`DetectResult`] with all discovered files.
 pub fn detect(root: &Path) -> DetectResult {
     detect_inner(root, false).0

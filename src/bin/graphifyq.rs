@@ -815,9 +815,13 @@ fn parse_sidecar_ps_line(line: &str) -> Option<SidecarProcess> {
     if !is_graphify_rs_executable(executable) || subcommand != "serve" {
         return None;
     }
+    if flag_value(command, "--transport").as_deref() != Some("http") {
+        return None;
+    }
+    let registry_path = flag_value(command, "--registry-path").map(PathBuf::from)?;
     Some(SidecarProcess {
         pid,
-        registry_path: flag_value(command, "--registry-path").map(PathBuf::from),
+        registry_path: Some(registry_path),
     })
 }
 
@@ -1181,6 +1185,21 @@ mod tests {
     #[test]
     fn parse_sidecar_ps_line_ignores_executable_suffix_traps() {
         let line = " 123 /tmp/notgraphify-rs serve --registry-path /tmp/not-a-real-sidecar.json";
+
+        assert_eq!(parse_sidecar_ps_line(line), None);
+    }
+
+    #[test]
+    fn parse_sidecar_ps_line_ignores_stdio_servers() {
+        let line = " 123 /Users/me/.cargo/bin/graphify-rs serve --transport stdio";
+
+        assert_eq!(parse_sidecar_ps_line(line), None);
+    }
+
+    #[test]
+    fn parse_sidecar_ps_line_requires_graphifyq_registry() {
+        let line =
+            " 123 /Users/me/.cargo/bin/graphify-rs serve --transport http --http-bind 127.0.0.1:0";
 
         assert_eq!(parse_sidecar_ps_line(line), None);
     }

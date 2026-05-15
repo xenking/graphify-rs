@@ -27,7 +27,7 @@ const SENSITIVE_FILENAMES: &[&str] = &[
 ];
 
 /// Word-boundary substrings to match against the filename stem (without extension).
-/// Uses `_` and `.` as word boundaries to avoid false positives like
+/// Uses `_`, `.`, and `-` as word boundaries to avoid false positives like
 /// "secret_resolver.rs" or "tokenizer.rs".
 const SENSITIVE_WORDS: &[&str] = &[
     "credentials",
@@ -50,17 +50,15 @@ const SENSITIVE_WORDS: &[&str] = &[
 const SENSITIVE_DIR_SEGMENTS: &[&str] =
     &["secrets", "credentials", ".ssh", ".gnupg", ".aws", ".kube"];
 
-/// Check if `word` appears as a complete word in `s`, using `_` and `.` as boundaries.
+/// Check if `word` appears as a complete word in `s`.
 fn matches_word(s: &str, word: &str) -> bool {
     let mut start = 0;
     while let Some(pos) = s[start..].find(word) {
         let abs_pos = start + pos;
         let after = abs_pos + word.len();
 
-        let boundary_before =
-            abs_pos == 0 || s.as_bytes()[abs_pos - 1] == b'_' || s.as_bytes()[abs_pos - 1] == b'.';
-        let boundary_after =
-            after >= s.len() || s.as_bytes()[after] == b'_' || s.as_bytes()[after] == b'.';
+        let boundary_before = abs_pos == 0 || is_sensitive_word_boundary(s.as_bytes()[abs_pos - 1]);
+        let boundary_after = after >= s.len() || is_sensitive_word_boundary(s.as_bytes()[after]);
 
         if boundary_before && boundary_after {
             return true;
@@ -68,6 +66,10 @@ fn matches_word(s: &str, word: &str) -> bool {
         start = abs_pos + 1;
     }
     false
+}
+
+fn is_sensitive_word_boundary(byte: u8) -> bool {
+    matches!(byte, b'_' | b'.' | b'-')
 }
 
 /// Returns `true` when the file at `path` looks like it contains secrets.
@@ -98,8 +100,9 @@ pub fn is_sensitive(path: &Path) -> bool {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    let hyphen_normalized_stem = stem.replace('-', "_");
     for word in SENSITIVE_WORDS {
-        if matches_word(&stem, word) {
+        if matches_word(&stem, word) || matches_word(&hyphen_normalized_stem, word) {
             return true;
         }
     }
@@ -147,6 +150,14 @@ mod tests {
         assert!(is_sensitive(Path::new("api_token.json")));
         assert!(is_sensitive(Path::new("my_credentials.yaml")));
         assert!(is_sensitive(Path::new("private_key.pem")));
+    }
+
+    #[test]
+    fn sensitive_hyphenated_secret_filenames() {
+        assert!(is_sensitive(Path::new("api-token.json")));
+        assert!(is_sensitive(Path::new("auth-token.txt")));
+        assert!(is_sensitive(Path::new("private-key.backup")));
+        assert!(is_sensitive(Path::new("my-secret.yaml")));
     }
 
     #[test]
