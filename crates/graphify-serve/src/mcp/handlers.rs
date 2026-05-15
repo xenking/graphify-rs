@@ -163,6 +163,11 @@ fn query_context(
         }
 
         let degree = graph.degree(&current);
+        if !should_expand_query_node(graph, &current) && degree > limits.max_neighbors_per_node {
+            truncated = true;
+            omitted_nodes += degree;
+            continue;
+        }
         let per_node_limit = if degree > limits.hub_degree_cutoff {
             truncated = true;
             limits.max_neighbors_per_node.min(6)
@@ -211,6 +216,17 @@ fn query_context(
         omitted_nodes,
         omitted_edges,
     }
+}
+
+fn should_expand_query_node(graph: &KnowledgeGraph, node_id: &str) -> bool {
+    graph.get_node(node_id).is_some_and(|node| {
+        !matches!(
+            node.node_type,
+            graphify_core::model::NodeType::File
+                | graphify_core::model::NodeType::Module
+                | graphify_core::model::NodeType::Package
+        )
+    })
 }
 
 fn query_node_score(graph: &KnowledgeGraph, node_id: &str, terms: &[String]) -> f64 {
@@ -270,6 +286,32 @@ fn query_seed_candidate(graph: &KnowledgeGraph, node_id: &str, terms: &[String])
             | graphify_core::model::NodeType::Module
             | graphify_core::model::NodeType::Package
     )
+}
+
+pub(super) fn semantic_seed_candidate(
+    graph: &KnowledgeGraph,
+    candidate: &graphify_embed::SemanticMatch,
+    terms: &[String],
+    identifier_query: bool,
+) -> bool {
+    let lexical_supported =
+        query_node_score(graph, &candidate.node_id, terms) > 0.0 || candidate.lexical_score >= 0.5;
+    if identifier_query && !lexical_supported {
+        return false;
+    }
+    query_seed_candidate(graph, &candidate.node_id, terms)
+}
+
+fn query_has_code_identifier(question: &str) -> bool {
+    question
+        .split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.')
+        .any(|raw| {
+            raw.len() > 4
+                && (raw.contains('_')
+                    || raw.contains('.')
+                    || raw.chars().any(|ch| ch.is_ascii_lowercase())
+                        && raw.chars().any(|ch| ch.is_ascii_uppercase()))
+        })
 }
 
 fn query_context_to_value(
@@ -489,6 +531,7 @@ pub(crate) fn handle_query_graph(
     }
 
     let terms = query_search_terms(question);
+    let identifier_query = query_has_code_identifier(question);
 
     if terms.is_empty() {
         return tool_result_text("No meaningful search terms found in the question.");
@@ -510,8 +553,8 @@ pub(crate) fn handle_query_graph(
                 start.extend(
                     matches
                         .into_iter()
-                        .map(|m| m.node_id)
-                        .filter(|id| query_seed_candidate(graph, id, &terms)),
+                        .filter(|m| semantic_seed_candidate(graph, m, &terms, identifier_query))
+                        .map(|m| m.node_id),
                 );
             }
             Err(err) => {

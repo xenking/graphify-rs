@@ -398,6 +398,44 @@ mod tests {
     }
 
     #[test]
+    fn query_graph_does_not_expand_file_hub_neighbors() {
+        let mut g = KnowledgeGraph::new();
+        g.add_node(make_node("control_hid", "control_hid()", Some(0)))
+            .unwrap();
+        let mut file = make_node("file_hub", "src/control_hid.rs", Some(0));
+        file.node_type = NodeType::File;
+        g.add_node(file).unwrap();
+        g.add_edge(make_edge("control_hid", "file_hub")).unwrap();
+
+        for idx in 0..40 {
+            let id = format!("leaf_{idx}");
+            let label = format!("UnrelatedNeighbor{idx}");
+            g.add_node(make_node(&id, &label, Some(1))).unwrap();
+            g.add_edge(make_edge("file_hub", &id)).unwrap();
+        }
+
+        let req = json!({
+            "jsonrpc": "2.0", "method": "tools/call", "id": 35,
+            "params": {
+                "name": "query_graph",
+                "arguments": {
+                    "question": "control_hid RemoteHID",
+                    "budget": 500,
+                    "format": "json"
+                }
+            }
+        });
+        let resp = dispatch(&g, &req).unwrap();
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        let value: Value = serde_json::from_str(text).unwrap();
+        let nodes = value["nodes"].as_array().unwrap();
+
+        assert!(nodes.iter().any(|node| node["id"] == "file_hub"));
+        assert!(!nodes.iter().any(|node| node["id"] == "leaf_39"));
+        assert!(nodes.len() <= 3);
+    }
+
+    #[test]
     fn test_semantic_query_without_index_is_actionable_error() {
         let g = test_graph();
         let req = json!({
@@ -445,6 +483,35 @@ mod tests {
         assert!(text.contains("semantic query unavailable"));
         assert!(text.contains("falling back to lexical query"));
         assert!(text.contains("AuthService"));
+    }
+
+    #[test]
+    fn semantic_seed_requires_lexical_support_for_identifier_queries() {
+        let mut g = KnowledgeGraph::new();
+        g.add_node(make_node("control_hid", "control_hid()", Some(0)))
+            .unwrap();
+        g.add_node(make_node("webpage", "ingest_webpage()", Some(0)))
+            .unwrap();
+        let terms = vec!["control_hid".to_string()];
+        let fuzzy = graphify_embed::SemanticMatch {
+            node_id: "webpage".into(),
+            label: "ingest_webpage()".into(),
+            source_file: "./src/web.rs".into(),
+            score: 0.95,
+            semantic_score: 0.95,
+            lexical_score: 0.0,
+        };
+        let exact = graphify_embed::SemanticMatch {
+            node_id: "control_hid".into(),
+            label: "control_hid()".into(),
+            source_file: "./src/control_hid.rs".into(),
+            score: 0.95,
+            semantic_score: 0.9,
+            lexical_score: 1.0,
+        };
+
+        assert!(!handlers::semantic_seed_candidate(&g, &fuzzy, &terms, true));
+        assert!(handlers::semantic_seed_candidate(&g, &exact, &terms, true));
     }
 
     #[test]
