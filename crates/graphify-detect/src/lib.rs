@@ -22,7 +22,9 @@ pub use classify::{DetectedFile, FileType, classify_file};
 pub use ignore::load_graphifyignore;
 pub use sensitive::is_sensitive;
 
-use constants::{CORPUS_UPPER_THRESHOLD, CORPUS_WARN_THRESHOLD, FILE_COUNT_UPPER, SKIP_DIRS};
+use constants::{
+    CORPUS_UPPER_THRESHOLD, CORPUS_WARN_THRESHOLD, DOC_EXTENSIONS, FILE_COUNT_UPPER, SKIP_DIRS,
+};
 use ignore::IgnoreSet;
 
 /// Errors that can occur during file detection.
@@ -83,20 +85,20 @@ pub fn save_manifest(path: &Path, manifest: &Manifest) -> Result<(), DetectError
 
 /// Walk `root` and return a [`DetectResult`] with all discovered files.
 pub fn detect(root: &Path) -> DetectResult {
-    detect_inner(root, false, None).0
+    detect_inner(root, false).0
 }
 
-/// Internal detect that optionally computes content hashes during the walk
-/// to avoid double I/O when doing incremental detection.
+/// Internal detect that optionally computes content hashes during the walk.
 ///
-/// When `compute_hashes` is true, hashes are computed from the file content
-/// already read by `count_words`, eliminating a separate read pass.
+/// When `compute_hashes` is true, hashes are computed from bytes read once
+/// during the walk. Word counts are restricted to UTF-8 text source/docs, so
+/// binary files and image formats are not read a second time through UTF-8
+/// APIs just to discover they have no countable words.
 /// Returns `(DetectResult, Option<HashMap<String, String>>)` where the second
 /// element is the hash map when `compute_hashes` is true.
 fn detect_inner(
     root: &Path,
     compute_hashes: bool,
-    old_hashes: Option<&HashMap<String, String>>,
 ) -> (DetectResult, Option<HashMap<String, String>>) {
     let ignore_patterns = load_graphifyignore(root);
     let ignore_set = IgnoreSet::new(root, &ignore_patterns);
@@ -142,50 +144,13 @@ fn detect_inner(
 
         let rel = path_to_forward_slashes(path.strip_prefix(root).unwrap_or(path));
 
+        let count_words_for_file = counts_words_for_file(path, file_type);
         if compute_hashes {
-            if let Some(_old) = old_hashes.and_then(|h| h.get(&rel)) {
-                let full_path = root.join(&rel);
-                match fs::read_to_string(&full_path) {
-                    Ok(content) => {
-                        let hash = graphify_cache::content_hash(content.as_bytes());
-                        hashes.insert(rel.clone(), hash.clone());
-                        total_words += content.split_whitespace().count();
-                    }
-                    Err(_) => {
-                        let hash = graphify_cache::file_hash(path).unwrap_or_default();
-                        hashes.insert(rel.clone(), hash.clone());
-                    }
-                }
-            } else {
-                let full_path = root.join(&rel);
-                match fs::read_to_string(&full_path) {
-                    Ok(content) => {
-                        hashes.insert(
-                            rel.clone(),
-                            graphify_cache::content_hash(content.as_bytes()),
-                        );
-                        match file_type {
-                            FileType::Code | FileType::Document | FileType::Paper => {
-                                total_words += content.split_whitespace().count();
-                            }
-                            FileType::Image => {}
-                        }
-                    }
-                    Err(_) => {
-                        hashes.insert(
-                            rel.clone(),
-                            graphify_cache::file_hash(path).unwrap_or_default(),
-                        );
-                    }
-                }
-            }
-        } else {
-            match file_type {
-                FileType::Code | FileType::Document | FileType::Paper => {
-                    total_words += count_words(path);
-                }
-                FileType::Image => {}
-            }
+            let (hash, word_count) = hash_and_count_words(path, count_words_for_file);
+            hashes.insert(rel.clone(), hash);
+            total_words += word_count;
+        } else if count_words_for_file {
+            total_words += count_words(path);
         }
 
         files.entry(file_type).or_default().push(rel);
@@ -243,7 +208,7 @@ pub fn detect_incremental(root: &Path, manifest_path: Option<&str>) -> DetectRes
     let manifest_file = root.join(manifest_path.unwrap_or(DEFAULT_MANIFEST_NAME));
     let old_manifest = load_manifest(&manifest_file).unwrap_or_default();
 
-    let (result, new_hashes) = detect_inner(root, true, Some(&old_manifest.hashes));
+    let (result, new_hashes) = detect_inner(root, true);
     let new_hashes = new_hashes.unwrap_or_default();
 
     let mut new_manifest = Manifest {
@@ -330,6 +295,39 @@ fn is_noise_dir(name: &str) -> bool {
         || name.ends_with("_venv")
         || name.ends_with("_env")
         || name.ends_with(".egg-info")
+}
+
+fn counts_words_for_file(path: &Path, file_type: FileType) -> bool {
+    match file_type {
+        FileType::Code => true,
+        FileType::Document | FileType::Paper => has_extension(path, DOC_EXTENSIONS),
+        FileType::Image => false,
+    }
+}
+
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_ascii_lowercase()))
+        .is_some_and(|ext| extensions.contains(&ext.as_str()))
+}
+
+fn hash_and_count_words(path: &Path, should_count_words: bool) -> (String, usize) {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return (String::new(), 0),
+    };
+
+    let hash = graphify_cache::content_hash(&bytes);
+    let word_count = if should_count_words {
+        std::str::from_utf8(&bytes)
+            .map(|content| content.split_whitespace().count())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    (hash, word_count)
 }
 
 /// Approximate word count for a file by splitting on whitespace.
@@ -535,6 +533,51 @@ mod tests {
         assert_eq!(r3.total_files, r1.total_files + 1);
         let code = r3.files.get(&FileType::Code).expect("expected code");
         assert!(code.iter().any(|p| p.contains("new_file.ts")));
+    }
+
+    #[test]
+    fn detect_incremental_does_not_count_svg_words_on_cached_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        fs::write(
+            root.join("diagram.svg"),
+            "<svg>these image words must not affect corpus counts</svg>",
+        )
+        .unwrap();
+
+        let r1 = detect_incremental(root, None);
+        let r2 = detect_incremental(root, None);
+
+        assert_eq!(r1.total_words, count_words(&root.join("main.rs")));
+        assert_eq!(r2.total_words, r1.total_words);
+        assert!(
+            r2.files
+                .get(&FileType::Image)
+                .is_some_and(|paths| paths.iter().any(|p| p == "diagram.svg"))
+        );
+    }
+
+    #[test]
+    fn detect_incremental_hashes_binary_images_without_word_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("logo.png"), [0xff, 0xfe, 0xfd, 0x00]).unwrap();
+
+        let r1 = detect_incremental(root, None);
+        let r2 = detect_incremental(root, None);
+        let manifest = load_manifest(&root.join(DEFAULT_MANIFEST_NAME)).unwrap();
+
+        assert_eq!(r1.total_words, 0);
+        assert_eq!(r2.total_words, 0);
+        assert!(manifest.hashes.contains_key("logo.png"));
+        assert!(
+            r2.files
+                .get(&FileType::Image)
+                .is_some_and(|paths| paths.iter().any(|p| p == "logo.png"))
+        );
     }
 
     #[test]

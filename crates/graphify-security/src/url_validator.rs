@@ -91,17 +91,44 @@ fn is_in_range(
     ip_u32 >= u32::from(*start) && ip_u32 <= u32::from(*end)
 }
 
-/// Try parsing non-standard IPv4 representations (decimal, hex, octal).
+/// Try parsing non-standard IPv4 representations accepted by many URL stacks:
+/// decimal/hex/octal integers plus dotted shorthand (`127.1`, `127.0.1`).
 fn parse_nonstandard_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
-    if let Ok(num) = host.parse::<u32>() {
-        return Some(std::net::Ipv4Addr::from(num));
+    let parts = host
+        .split('.')
+        .map(parse_ipv4_component)
+        .collect::<Option<Vec<_>>>()?;
+
+    let address = match parts.as_slice() {
+        [a] => *a,
+        [a, b] if *a <= 0xff && *b <= 0x00ff_ffff => (a << 24) | b,
+        [a, b, c] if *a <= 0xff && *b <= 0xff && *c <= 0xffff => (a << 24) | (b << 16) | c,
+        [a, b, c, d] if parts.iter().all(|part| *part <= 0xff) => {
+            (a << 24) | (b << 16) | (c << 8) | d
+        }
+        _ => return None,
+    };
+
+    Some(std::net::Ipv4Addr::from(address))
+}
+
+fn parse_ipv4_component(component: &str) -> Option<u32> {
+    if component.is_empty() {
+        return None;
     }
-    if let Some(hex) = host.strip_prefix("0x").or_else(|| host.strip_prefix("0X"))
-        && let Ok(num) = u32::from_str_radix(hex, 16)
+
+    if let Some(hex) = component
+        .strip_prefix("0x")
+        .or_else(|| component.strip_prefix("0X"))
     {
-        return Some(std::net::Ipv4Addr::from(num));
+        return u32::from_str_radix(hex, 16).ok();
     }
-    None
+
+    if component.len() > 1 && component.starts_with('0') {
+        return u32::from_str_radix(&component[1..], 8).ok();
+    }
+
+    component.parse().ok()
 }
 
 #[cfg(test)]
@@ -152,6 +179,17 @@ mod tests {
     }
 
     #[test]
+    fn test_reject_dotted_shorthand_loopback() {
+        for url in ["http://127.1/admin", "http://127.0.1/admin"] {
+            let result = validate_url(url);
+            assert!(
+                matches!(result, Err(SecurityError::PrivateIp(_))),
+                "{url} must be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn test_reject_10_network() {
         let result = validate_url("http://10.0.0.1/internal");
         assert!(matches!(result, Err(SecurityError::PrivateIp(_))));
@@ -173,6 +211,21 @@ mod tests {
     fn test_reject_172_31() {
         let result = validate_url("http://172.31.255.255/secret");
         assert!(matches!(result, Err(SecurityError::PrivateIp(_))));
+    }
+
+    #[test]
+    fn test_reject_dotted_shorthand_private_ranges() {
+        for url in [
+            "http://10.1/internal",
+            "http://172.16.1/secret",
+            "http://192.168.1/router",
+        ] {
+            let result = validate_url(url);
+            assert!(
+                matches!(result, Err(SecurityError::PrivateIp(_))),
+                "{url} must be rejected"
+            );
+        }
     }
 
     #[test]
