@@ -458,7 +458,7 @@ mod tests {
             &SemanticIndex {
                 version: 1,
                 model: "model2vec:__definitely_missing_model__".into(),
-                graph_fingerprint: "stale".into(),
+                graph_fingerprint: graphify_embed::graph_fingerprint(&g),
                 dim: 1,
                 nodes: vec![IndexedNode {
                     node_id: "auth".into(),

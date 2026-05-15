@@ -818,10 +818,9 @@ fn parse_sidecar_ps_line(line: &str) -> Option<SidecarProcess> {
     if flag_value(command, "--transport").as_deref() != Some("http") {
         return None;
     }
-    let registry_path = flag_value(command, "--registry-path").map(PathBuf::from)?;
     Some(SidecarProcess {
         pid,
-        registry_path: Some(registry_path),
+        registry_path: flag_value(command, "--registry-path").map(PathBuf::from),
     })
 }
 
@@ -836,7 +835,7 @@ fn is_graphify_rs_executable(executable: &str) -> bool {
 
 fn sidecar_is_stale(sidecar: &SidecarProcess) -> bool {
     let Some(registry_path) = &sidecar.registry_path else {
-        return true;
+        return false;
     };
     match read_registry(registry_path) {
         Ok(registry) => registry.pid != sidecar.pid,
@@ -1197,11 +1196,15 @@ mod tests {
     }
 
     #[test]
-    fn parse_sidecar_ps_line_requires_graphifyq_registry() {
+    fn parse_sidecar_ps_line_includes_registryless_http_sidecars() {
         let line =
             " 123 /Users/me/.cargo/bin/graphify-rs serve --transport http --http-bind 127.0.0.1:0";
 
-        assert_eq!(parse_sidecar_ps_line(line), None);
+        let sidecar = parse_sidecar_ps_line(line).unwrap();
+
+        assert_eq!(sidecar.pid, 123);
+        assert_eq!(sidecar.registry_path, None);
+        assert!(!sidecar_is_stale(&sidecar));
     }
 
     #[test]

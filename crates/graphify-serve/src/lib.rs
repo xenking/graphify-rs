@@ -46,15 +46,17 @@ pub struct SemanticState {
 impl SemanticState {
     pub fn load_for_graph_path(
         graph_path: &Path,
-        _graph: &KnowledgeGraph,
+        graph: &KnowledgeGraph,
     ) -> std::result::Result<Option<Self>, ServeError> {
         let index_path = default_index_path_for_graph(graph_path);
         if !index_path.exists() {
             return Ok(None);
         }
+        let engine = SemanticEngine::load_for_graph(&index_path, graph)
+            .map_err(|err| ServeError::GraphLoad(format!("load semantic index: {err:#}")))?;
         Ok(Some(Self {
             index_path,
-            engine: Mutex::new(None),
+            engine: Mutex::new(Some(engine)),
         }))
     }
 
@@ -931,6 +933,40 @@ mod tests {
         g.add_edge(make_edge("user", "db")).unwrap();
         g.add_edge(make_edge("user", "cache")).unwrap();
         g
+    }
+
+    #[test]
+    fn semantic_state_validates_index_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let graph = make_test_graph();
+        let index_path = graphify_embed::default_index_path_for_graph(&graph_path);
+        let index = graphify_embed::SemanticIndex {
+            version: 1,
+            model: graphify_embed::DEFAULT_MODEL.to_string(),
+            graph_fingerprint: graphify_embed::graph_fingerprint(&graph),
+            dim: 1,
+            nodes: Vec::new(),
+        };
+        graphify_embed::write_index(&index, &index_path).unwrap();
+
+        let state = SemanticState::load_for_graph_path(&graph_path, &graph)
+            .unwrap()
+            .expect("semantic state should load");
+
+        assert!(state.description().contains("0 nodes via"));
+    }
+
+    #[test]
+    fn semantic_state_rejects_corrupt_index_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let index_path = graphify_embed::default_index_path_for_graph(&graph_path);
+        std::fs::write(index_path, "{not-json").unwrap();
+
+        let result = SemanticState::load_for_graph_path(&graph_path, &make_test_graph());
+
+        assert!(matches!(result, Err(ServeError::GraphLoad(_))));
     }
 
     #[test]
