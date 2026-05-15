@@ -13,6 +13,7 @@ serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+toml = "0.8"
 minijinja = "2"
 
 [dev-dependencies]

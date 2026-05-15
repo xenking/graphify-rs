@@ -61,13 +61,16 @@ enum Commands {
         /// Stable provider/cache label for --llm-command output.
         #[arg(long)]
         llm_provider: Option<String>,
+        /// Logical service name for architecture manifests and LikeC4 diagrams.
+        #[arg(long)]
+        service_name: Option<String>,
         /// Only process code files, skip docs and papers.
         #[arg(long)]
         code_only: bool,
         /// Only re-extract new/modified files since last build
         #[arg(long)]
         update: bool,
-        /// Export formats (comma-separated). Available: json,html,graphml,cypher,svg,wiki,obsidian,report,context. Default: all
+        /// Export formats (comma-separated). Available: json,html,architecture,likec4,graphml,cypher,svg,wiki,obsidian,report,context. Default: all
         #[arg(long, value_delimiter = ',')]
         format: Vec<String>,
         /// Maximum nodes in HTML visualization (default: 2000). Larger values may slow browser.
@@ -85,6 +88,21 @@ enum Commands {
         /// Enable legacy Anthropic document semantic extraction. Default document indexing is local and does not require API keys.
         #[arg(long)]
         anthropic_semantic: bool,
+        /// Maximum nodes exported to LikeC4 diagrams.
+        #[arg(long)]
+        likec4_max_nodes: Option<usize>,
+        /// Maximum relationships exported to LikeC4 diagrams.
+        #[arg(long)]
+        likec4_max_relations: Option<usize>,
+        /// LikeC4 detail level: architecture, balanced, or full.
+        #[arg(long, value_enum)]
+        likec4_detail: Option<LikeC4DetailArg>,
+        /// Only include LikeC4 nodes from matching paths. Supports simple * globs; repeat or comma-separate.
+        #[arg(long, value_delimiter = ',')]
+        likec4_include_path: Vec<String>,
+        /// Exclude LikeC4 nodes from matching paths. Supports simple * globs; repeat or comma-separate.
+        #[arg(long, value_delimiter = ',')]
+        likec4_exclude_path: Vec<String>,
     },
     /// Install graphify skill for AI coding assistant
     Install {
@@ -103,6 +121,26 @@ enum Commands {
         /// Disable semantic-index lookup even if .graphify/semantic-index.json exists.
         #[arg(long)]
         no_semantic: bool,
+    },
+    /// Compose multiple service architecture manifests into a top-level C4 landscape
+    Compose {
+        /// Path to .graphify/architecture.json or a directory containing it. Repeat per service.
+        #[arg(short, long)]
+        input: Vec<String>,
+        /// Discover nested .graphify/architecture.json files under this root. Repeat or comma-separate.
+        #[arg(long, value_delimiter = ',')]
+        discover: Vec<String>,
+        #[arg(short, long, default_value = ".graphify/landscape")]
+        output: String,
+        /// Export formats (comma-separated). Available: json,likec4. Default: both
+        #[arg(long, value_delimiter = ',')]
+        format: Vec<String>,
+        /// Run LikeC4 validate and format --check after writing a LikeC4 workspace.
+        #[arg(long)]
+        validate: bool,
+        /// Run likec4 export json into likec4-model.json after writing a LikeC4 workspace.
+        #[arg(long)]
+        export_likec4_json: bool,
     },
     /// Run benchmark
     Benchmark {
@@ -252,6 +290,34 @@ enum McpTransport {
     Http,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum LikeC4DetailArg {
+    Architecture,
+    Balanced,
+    Full,
+}
+
+impl From<LikeC4DetailArg> for graphify_export::LikeC4Detail {
+    fn from(value: LikeC4DetailArg) -> Self {
+        match value {
+            LikeC4DetailArg::Architecture => Self::Architecture,
+            LikeC4DetailArg::Balanced => Self::Balanced,
+            LikeC4DetailArg::Full => Self::Full,
+        }
+    }
+}
+
+fn parse_likec4_detail(value: &str) -> Result<graphify_export::LikeC4Detail> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "architecture" | "arch" => Ok(graphify_export::LikeC4Detail::Architecture),
+        "balanced" | "default" => Ok(graphify_export::LikeC4Detail::Balanced),
+        "full" => Ok(graphify_export::LikeC4Detail::Full),
+        other => anyhow::bail!(
+            "invalid likec4_detail '{other}'; expected architecture, balanced, or full"
+        ),
+    }
+}
+
 /// Verbosity level derived from --quiet / --verbose flags.
 #[derive(Clone, Copy)]
 enum Verbosity {
@@ -334,6 +400,7 @@ async fn main() -> Result<()> {
             llm,
             llm_command,
             llm_provider,
+            service_name,
             code_only,
             update,
             format,
@@ -342,6 +409,11 @@ async fn main() -> Result<()> {
             embedding_provider,
             embedding_model,
             anthropic_semantic,
+            likec4_max_nodes,
+            likec4_max_relations,
+            likec4_detail,
+            likec4_include_path,
+            likec4_exclude_path,
         } => {
             // Merge config file defaults with CLI args
             let cfg = config::load_config(Path::new(&path));
@@ -361,6 +433,7 @@ async fn main() -> Result<()> {
             let effective_llm_provider = llm_provider
                 .or(cfg.llm_provider)
                 .unwrap_or_else(|| "cli".to_string());
+            let effective_service_name = service_name.or(cfg.service_name);
             let effective_llm_cli = if effective_llm_enabled {
                 effective_llm_command.map(|command| llm::LlmCliConfig {
                     provider: effective_llm_provider,
@@ -393,6 +466,35 @@ async fn main() -> Result<()> {
             } else {
                 format
             };
+            let config_likec4_detail = cfg
+                .likec4_detail
+                .as_deref()
+                .map(parse_likec4_detail)
+                .transpose()?;
+            let effective_likec4_options = graphify_export::LikeC4Options {
+                service_name: effective_service_name,
+                root_path: None,
+                max_nodes: likec4_max_nodes
+                    .or(cfg.likec4_max_nodes)
+                    .unwrap_or(graphify_export::DEFAULT_LIKEC4_MAX_NODES),
+                max_relations: likec4_max_relations
+                    .or(cfg.likec4_max_relations)
+                    .unwrap_or(graphify_export::DEFAULT_LIKEC4_MAX_RELATIONS),
+                detail: likec4_detail
+                    .map(Into::into)
+                    .or(config_likec4_detail)
+                    .unwrap_or_default(),
+                include_paths: if likec4_include_path.is_empty() {
+                    cfg.likec4_include_paths.unwrap_or_default()
+                } else {
+                    likec4_include_path
+                },
+                exclude_paths: if likec4_exclude_path.is_empty() {
+                    cfg.likec4_exclude_paths.unwrap_or_default()
+                } else {
+                    likec4_exclude_path
+                },
+            };
 
             cmd_build(
                 &effective_path,
@@ -409,6 +511,7 @@ async fn main() -> Result<()> {
                 &effective_embedding_provider,
                 &effective_embedding_model,
                 effective_anthropic_semantic,
+                &effective_likec4_options,
             )
             .await?;
         }
@@ -423,6 +526,24 @@ async fn main() -> Result<()> {
             no_semantic,
         } => {
             cmd_query(&question, dfs, budget, &graph, !no_semantic)?;
+        }
+        Commands::Compose {
+            input,
+            discover,
+            output,
+            format,
+            validate,
+            export_likec4_json,
+        } => {
+            cmd_compose(
+                &input,
+                &discover,
+                &output,
+                &format,
+                validate,
+                export_likec4_json,
+                verb,
+            )?;
         }
         Commands::Benchmark { graph_path } => {
             let result = graphify_benchmark::run_benchmark(Path::new(&graph_path), None)?;
@@ -856,16 +977,32 @@ async fn cmd_build(
     embedding_provider: &str,
     embedding_model: &str,
     anthropic_semantic: bool,
+    likec4_options: &graphify_export::LikeC4Options,
 ) -> Result<()> {
     let root = PathBuf::from(path);
     let output_dir = PathBuf::from(output);
+    let mut likec4_options = likec4_options.clone();
+    if likec4_options.root_path.is_none() {
+        likec4_options.root_path =
+            Some(std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone()));
+    }
     ensure_local_output_excluded(&root, &output_dir);
     std::fs::create_dir_all(&output_dir)?;
     let cache_dir = output_dir.join("cache");
 
     // Determine which formats to export (empty = all)
     let all_formats = [
-        "json", "html", "graphml", "cypher", "svg", "wiki", "obsidian", "report", "context",
+        "json",
+        "html",
+        "architecture",
+        "likec4",
+        "graphml",
+        "cypher",
+        "svg",
+        "wiki",
+        "obsidian",
+        "report",
+        "context",
     ];
     let selected: Vec<&str> = if formats.is_empty() {
         all_formats.to_vec()
@@ -1276,6 +1413,54 @@ async fn cmd_build(
         );
     }
 
+    if should_export("architecture")
+        && !(should_export("likec4")
+            && matches!(
+                likec4_options.detail,
+                graphify_export::LikeC4Detail::Architecture
+            ))
+    {
+        let architecture_defaults = graphify_export::ArchitectureOptions::default();
+        let architecture_path = graphify_export::export_architecture_manifest(
+            &graph,
+            &output_dir,
+            &graphify_export::ArchitectureOptions {
+                service_name: likec4_options.service_name.clone(),
+                root_path: likec4_options.root_path.clone(),
+                max_packages: if likec4_options.max_nodes
+                    == graphify_export::DEFAULT_LIKEC4_MAX_NODES
+                {
+                    architecture_defaults.max_packages
+                } else {
+                    likec4_options.max_nodes
+                },
+                max_dependencies: likec4_options.max_relations,
+                include_paths: likec4_options.include_paths.clone(),
+                exclude_paths: likec4_options.exclude_paths.clone(),
+            },
+        )?;
+        info_print!(
+            verb,
+            "  Wrote {}",
+            architecture_path.display().to_string().dimmed()
+        );
+    }
+
+    if should_export("likec4") {
+        let likec4_path = graphify_export::export_likec4_with_options(
+            &graph,
+            &communities,
+            &community_labels,
+            &output_dir,
+            &likec4_options,
+        )?;
+        info_print!(
+            verb,
+            "  Wrote {}/",
+            likec4_path.display().to_string().dimmed()
+        );
+    }
+
     // Prepare analysis data
     let detection_json = serde_json::json!({
         "total_files": detection.total_files,
@@ -1462,6 +1647,199 @@ fn cmd_query(
     let text = graphify_serve::subgraph_to_text(&graph, &nodes, &edges, budget);
     println!("{}", text);
 
+    Ok(())
+}
+
+fn cmd_compose(
+    inputs: &[String],
+    discover_roots: &[String],
+    output: &str,
+    formats: &[String],
+    validate: bool,
+    export_likec4_json: bool,
+    verb: Verbosity,
+) -> Result<()> {
+    let mut manifest_paths = inputs
+        .iter()
+        .map(|input| architecture_manifest_path(Path::new(input)))
+        .collect::<Vec<_>>();
+    manifest_paths.extend(discover_architecture_manifests(discover_roots)?);
+    manifest_paths.sort();
+    manifest_paths.dedup();
+
+    let mut manifests = Vec::with_capacity(manifest_paths.len());
+    for path in &manifest_paths {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read architecture manifest {}", path.display()))?;
+        let manifest: graphify_export::ArchitectureManifest = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse architecture manifest {}", path.display()))?;
+        manifests.push(manifest);
+    }
+    if manifests.len() < 2 {
+        anyhow::bail!("compose requires at least two architecture manifests");
+    }
+
+    let selected: Vec<&str> = if formats.is_empty() {
+        vec!["json", "likec4"]
+    } else {
+        formats.iter().map(String::as_str).collect()
+    };
+    let should_export = |name: &str| selected.iter().any(|s| s.eq_ignore_ascii_case(name));
+    let output_dir = PathBuf::from(output);
+    std::fs::create_dir_all(&output_dir)?;
+    write_compose_index(&output_dir, &manifest_paths, &manifests)?;
+
+    if should_export("json") && !should_export("likec4") {
+        let landscape = graphify_export::compose_architecture_manifests(&manifests);
+        let path = output_dir.join("landscape.json");
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&landscape)?),
+        )?;
+        info_print!(verb, "  Wrote {}", path.display().to_string().dimmed());
+    }
+
+    if should_export("likec4") {
+        let workspace = graphify_export::export_landscape_workspace(&manifests, &output_dir)?;
+        info_print!(
+            verb,
+            "  Wrote {}/",
+            workspace.display().to_string().dimmed()
+        );
+        if validate {
+            run_likec4(&workspace, &["validate"])?;
+            run_likec4(&workspace, &["format", "--check"])?;
+        }
+        if export_likec4_json {
+            run_likec4(&workspace, &["export", "json", "-o", "likec4-model.json"])?;
+        }
+    } else if should_export("json") {
+        // Already written above.
+    } else {
+        anyhow::bail!("unsupported compose format; expected json or likec4");
+    }
+
+    info_print!(
+        verb,
+        "\n{} Output in {}",
+        "✓ Done!".green().bold(),
+        output_dir.display()
+    );
+    Ok(())
+}
+
+fn architecture_manifest_path(path: &Path) -> PathBuf {
+    if path.is_dir() {
+        let direct = path.join("architecture.json");
+        if direct.exists() {
+            return direct;
+        }
+        let graphify = path.join(".graphify/architecture.json");
+        if graphify.exists() {
+            return graphify;
+        }
+        direct
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn discover_architecture_manifests(roots: &[String]) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    for root in roots {
+        discover_architecture_manifests_in(Path::new(root), &mut found)
+            .with_context(|| format!("failed to discover architecture manifests under {root}"))?;
+    }
+    found.sort();
+    found.dedup();
+    Ok(found)
+}
+
+fn discover_architecture_manifests_in(root: &Path, found: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.exists() {
+        anyhow::bail!("discover root does not exist: {}", root.display());
+    }
+    if root.is_file() {
+        if root.file_name().and_then(|name| name.to_str()) == Some("architecture.json") {
+            found.push(root.to_path_buf());
+        }
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(root)
+        .with_context(|| format!("failed to read directory {}", root.display()))?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if should_skip_discovery_dir(&path) {
+                continue;
+            }
+            discover_architecture_manifests_in(&path, found)?;
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some("architecture.json")
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some(".graphify")
+        {
+            found.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_discovery_dir(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(".git" | ".likec4" | "node_modules" | "target" | "dist" | "build")
+    )
+}
+
+fn write_compose_index(
+    output_dir: &Path,
+    manifest_paths: &[PathBuf],
+    manifests: &[graphify_export::ArchitectureManifest],
+) -> Result<()> {
+    let inputs = manifest_paths
+        .iter()
+        .zip(manifests.iter())
+        .map(|(path, manifest)| {
+            serde_json::json!({
+                "service": manifest.service.name,
+                "path": path.to_string_lossy(),
+                "module_prefixes": manifest.service.module_prefixes,
+                "provided_contracts": manifest.contracts.provided.len(),
+                "consumed_contracts": manifest.contracts.consumed.len(),
+                "unresolved_contracts": manifest.contracts.unresolved.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let index = serde_json::json!({
+        "schema_version": 1,
+        "generator": "graphify-rs",
+        "inputs": inputs,
+    });
+    std::fs::write(
+        output_dir.join("architecture.index.json"),
+        format!("{}\n", serde_json::to_string_pretty(&index)?),
+    )?;
+    Ok(())
+}
+
+fn run_likec4(workspace: &Path, args: &[&str]) -> Result<()> {
+    let status = std::process::Command::new("npx")
+        .arg("--yes")
+        .arg("likec4@1.56.0")
+        .args(args)
+        .current_dir(workspace)
+        .status()
+        .with_context(|| "failed to run npx likec4")?;
+    if !status.success() {
+        anyhow::bail!("likec4 {} failed with {status}", args.join(" "));
+    }
     Ok(())
 }
 
@@ -1698,9 +2076,19 @@ fn cmd_init() -> Result<()> {
 # embed = false
 # embedding_model = "minishlab/potion-code-16M"
 
-# Export formats (comma-separated). Available: json,html,graphml,cypher,svg,wiki,obsidian,report
+# Export formats (comma-separated). Available: json,html,architecture,likec4,graphml,cypher,svg,wiki,obsidian,report,context
 # Leave empty or omit for all formats.
 # formats = ["json", "html", "report"]
+
+# Logical service name for architecture manifests and LikeC4 service diagrams
+# service_name = "my-service"
+
+# LikeC4 export controls
+# likec4_max_nodes = 250
+# likec4_max_relations = 150
+# likec4_detail = "balanced" # architecture | balanced | full
+# likec4_include_paths = ["cmd/", "internal/", "pkg/"]
+# likec4_exclude_paths = ["**/*.user.js", "docs/tmp/"]
 "#,
     )?;
     println!("{} Created graphify.toml", "✓".green());
@@ -1737,6 +2125,35 @@ mod tests {
                 || !std::fs::read_to_string(exclude_path)
                     .expect("read exclude")
                     .contains("graphify-out/")
+        );
+    }
+
+    #[test]
+    fn discover_architecture_manifests_finds_nested_graphify_outputs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service_a = dir.path().join("service-a/.graphify");
+        let service_b = dir.path().join("service-b/.graphify");
+        let ignored = dir.path().join("service-c/target/.graphify");
+        std::fs::create_dir_all(&service_a).expect("service-a");
+        std::fs::create_dir_all(&service_b).expect("service-b");
+        std::fs::create_dir_all(&ignored).expect("ignored");
+        std::fs::write(service_a.join("architecture.json"), "{}").expect("write a");
+        std::fs::write(service_b.join("architecture.json"), "{}").expect("write b");
+        std::fs::write(ignored.join("architecture.json"), "{}").expect("write ignored");
+
+        let found = discover_architecture_manifests(&[dir.path().to_string_lossy().to_string()])
+            .expect("discover");
+
+        let rel = found
+            .iter()
+            .map(|path| path.strip_prefix(dir.path()).expect("prefix").to_path_buf())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rel,
+            vec![
+                PathBuf::from("service-a/.graphify/architecture.json"),
+                PathBuf::from("service-b/.graphify/architecture.json"),
+            ]
         );
     }
 

@@ -58,12 +58,17 @@ Build the knowledge graph from files in a directory. This is the main pipeline: 
 | `--llm-provider <NAME>` | | `String` | `"cli"` | Stable cache label for the external LLM command output. |
 | `--code-only` | | `bool` | `false` | Only process code files, skip docs and papers. |
 | `--update` | | `bool` | `false` | Safe incremental rebuild: scan the full current file set, but reuse SHA256 extraction cache for unchanged files so `graph.json` stays complete. |
-| `--format <FMT,...>` | | `String` (comma-separated) | all formats | Export formats to generate. Available: `json`, `html`, `graphml`, `cypher`, `svg`, `wiki`, `obsidian`, `report`, `context`. |
+| `--format <FMT,...>` | | `String` (comma-separated) | all formats | Export formats to generate. Available: `json`, `html`, `likec4`, `graphml`, `cypher`, `svg`, `wiki`, `obsidian`, `report`, `context`. |
 | `--max-viz-nodes <N>` | | `usize` | `2000` | Maximum nodes in HTML visualization. Larger values show more detail but may slow the browser. |
 | `--embed` | | `bool` | `false` | Build `.graphify/semantic-index.json` for semantic graph search. `graphifyq ensure/query` enables this by default. |
 | `--embedding-provider <PROVIDER>` | | `String` | `model2vec` | Embedding backend: `model2vec`, `ollama`, or `voyage`. |
 | `--embedding-model <MODEL>` | | `String` | provider default | Model2Vec HF ID/local path, Ollama model name, or Voyage model name. Prefixes like `ollama:embeddinggemma` are accepted. |
 | `--anthropic-semantic` | | `bool` | `false` | Explicitly enable legacy Anthropic document concept extraction. Requires `ANTHROPIC_API_KEY`. |
+| `--likec4-max-nodes <N>` | | `usize` | `250` | Maximum nodes in generated LikeC4 model. |
+| `--likec4-max-relations <N>` | | `usize` | `150` | Maximum relationships in generated LikeC4 model. |
+| `--likec4-detail <LEVEL>` | | `architecture\|balanced\|full` | `balanced` | LikeC4 detail level. `architecture` keeps modules/packages/types, `balanced` also keeps non-temporary concepts/files, `full` keeps code-level nodes subject to caps. |
+| `--likec4-include-path <PATTERN,...>` | | `String[]` | | Only export LikeC4 nodes from matching source paths. Simple `*` globs are supported. |
+| `--likec4-exclude-path <PATTERN,...>` | | `String[]` | | Exclude matching source paths from LikeC4 output. Simple `*` globs are supported. |
 
 #### Examples
 
@@ -100,17 +105,42 @@ graphify-rs build --update
 # Only generate JSON and HTML
 graphify-rs build --format json,html
 
+# Generate capability-level architecture manifest + LikeC4 service diagram
+graphify-rs build --no-llm --format architecture,likec4 \
+  --likec4-detail architecture \
+  --service-name my-service
+cd .graphify/likec4
+npx likec4 start
+
+# Narrow LikeC4/architecture export for a service repo
+graphify-rs build --no-llm --format likec4 \
+  --likec4-detail architecture \
+  --likec4-include-path cmd/,internal/,pkg/ \
+  --likec4-exclude-path '**/*.user.js,docs/tmp/'
+
 # Only generate the report
 graphify-rs build --format report
 
 # Combine: fast incremental, code-only, JSON+report
 graphify-rs build --update --code-only --no-llm --format json,report
+
+# Compose multiple service architecture manifests into a top-level C4 landscape
+graphify-rs compose \
+  --input ../service-a/.graphify/architecture.json \
+  --input ../service-b/.graphify/architecture.json \
+  --output .graphify/landscape \
+  --validate --export-likec4-json
+
+# Discover existing manifests under a workspace
+graphify-rs compose --discover ../ --output .graphify/landscape
 ```
+
+`--format architecture` writes `.graphify/architecture.json`: compact service architecture manifest with service name, module prefixes, capabilities/contracts, inferred capability flows, package evidence, folded package dependencies, external imports, provided/consumed API/event/proto hints, and an exact contract registry (`contracts.provided/consumed/unresolved`). `--format likec4 --likec4-detail architecture` uses the same manifest to write `.graphify/likec4/` as a capability/contract-level C4 service diagram with inferred flows, `api` elements for provided contracts nested under owning capabilities, nested `operation` elements for RPC/methods, `component` implementation modules with folded module dependencies, and `externalApi` elements for unresolved consumed contracts. Re-running graphify refreshes generated `.c4` files but does not delete or rewrite manual layout snapshots created by the LikeC4 CLI under `.graphify/likec4/.likec4/`. No GitHub source links are emitted; private source hosts can resolve metadata fields externally. `graphify-rs compose` reads explicit manifests or discovers nested `.graphify/architecture.json` files with `--discover`, writes `.graphify/landscape/architecture.index.json`, `.graphify/landscape/landscape.json`, and a top-level LikeC4 workspace. Compose connects services through exact contract aliases first, then module-prefix/interface matches and service-named package evidence. The landscape renders concrete API/module-prefix dependencies, shows only dependency-referenced APIs, and splits multi-contract dependencies into separate API edges with operation labels/metadata; package-name-only guesses remain in JSON evidence but are not drawn. `--validate` runs `likec4 validate` and `likec4 format --check`; `--export-likec4-json` writes `likec4-model.json` for drift checks.
 
 #### Build Pipeline
 
 1. **Detect** — Scans `--path` for code, doc, paper, and image files (respects root `.gitignore`, `.git/info/exclude`, and `.graphifyignore`, skips sensitive files).
-2. **Extract AST (Pass 1)** — Deterministic tree-sitter + regex extraction for code files. Per-file SHA256 cache in `<output>/cache/`.
+2. **Extract AST (Pass 1)** — Deterministic tree-sitter + regex extraction for code files. Per-file SHA256 cache in `<output>/cache/`; after cached per-file results are merged, graphify resolves cross-file imports into relationship edges so downstream formats see real inter-file dependencies.
 3. **Local Document Context (Pass 1b)** — Markdown/RST/text headings and prose become concept nodes. This is LLM-free and runs unless `--code-only` is set.
 4. **Cached LLM Preservation** — Reuses `<output>/llm-cache/<provider>/` and legacy `<output>/cache/` semantic results so `--no-llm` rebuilds do not erase prior LLM enrichments from the emitted graph.
 5. **Optional External LLM CLI Extraction** — Runs with `--llm-command`/`llm_command`; graphify sends a strict JSON extraction prompt on stdin, caches results by content hash plus provider/command/prompt metadata, and passes the previous per-path extraction back into the prompt when a file changed. `graphify-llm-codex` is the bundled adapter for installed Codex CLI.
@@ -118,7 +148,7 @@ graphify-rs build --update --code-only --no-llm --format json,report
 7. **Build Graph** — Assemble nodes and edges, deduplicate, and annotate source quality (`source`, `generated`, `minified`, `test`, `build_artifact`, `dependency`, `project_context`).
 8. **Cluster** — Leiden community detection + cohesion scoring.
 9. **Analyze** — God nodes, surprising connections, suggested questions with generated/minified/test/build artifacts downranked.
-10. **Export** — Write selected formats to `--output`, including compact `LLM_CONTEXT.md` by default.
+10. **Export** — Write selected formats to `--output`, including compact `LLM_CONTEXT.md`, capability-level `architecture.json`, and LikeC4 workspaces when requested.
 
 ---
 
@@ -544,9 +574,19 @@ Generated file:
 # Only process code files (skip docs/papers)
 # code_only = false
 
-# Export formats (comma-separated). Available: json,html,graphml,cypher,svg,wiki,obsidian,report
+# Export formats (comma-separated). Available: json,html,architecture,likec4,graphml,cypher,svg,wiki,obsidian,report,context
 # Leave empty or omit for all formats.
 # formats = ["json", "html", "report"]
+
+# Logical service name for architecture manifests and LikeC4 service diagrams
+# service_name = "my-service"
+
+# LikeC4 export controls
+# likec4_max_nodes = 250
+# likec4_max_relations = 150
+# likec4_detail = "balanced" # architecture | balanced | full
+# likec4_include_paths = ["cmd/", "internal/", "pkg/"]
+# likec4_exclude_paths = ["**/*.user.js", "docs/tmp/"]
 ```
 
 ---
@@ -789,8 +829,8 @@ These platforms use a generic integration that only writes the `## graphify` sec
 
 Once installed, the agent follows these rules (injected into `CLAUDE.md` or `AGENTS.md`):
 
-1. **Before answering architecture or codebase questions** — prefer `graphifyq query "<question>" --format toon`; it uses the local Model2Vec semantic index by default and auto-refreshes stale graphs every 300s.
-2. **For broad orientation** — read `.graphify/GRAPH_REPORT.md` for god nodes and community structure.
+1. **For broad orientation** — prefer `graphifyq summary architecture --budget 2000 --format toon`, then read `.graphify/GRAPH_REPORT.md` for god nodes and community structure when needed.
+2. **For focused lookup** — use `graphifyq query "<focused identifiers or subsystem>" --format toon`; avoid pasting whole user prompts with generic words into `query`.
 3. **If `.graphify/wiki/index.md` exists** — navigate the wiki instead of reading raw files.
 4. **For graphifyq agent context** — default `query`, `summary`, `stats`, and `tool` to `--format toon`; omit it only when the user asks for prose/human-readable text.
 5. **For strict AST-only/offline startup** — pass `--no-embed` to `graphifyq ensure/query`.

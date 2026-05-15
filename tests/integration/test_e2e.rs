@@ -718,6 +718,15 @@ fn test_all_export_formats() {
         graphify_export::export_wiki(&graph, &communities, &community_labels, &output_dir).unwrap();
     assert!(p.exists(), "wiki dir should exist");
 
+    // LikeC4
+    let p = graphify_export::export_likec4(&graph, &communities, &community_labels, &output_dir)
+        .unwrap();
+    assert!(p.exists(), "likec4 dir should exist");
+    assert!(
+        p.join("model.c4").exists(),
+        "likec4 model file should exist"
+    );
+
     // Report
     let god_list = graphify_analyze::god_nodes(&graph, 5);
     let surprise_list = graphify_analyze::surprising_connections(&graph, &communities, 3);

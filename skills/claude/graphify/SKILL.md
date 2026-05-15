@@ -34,6 +34,38 @@ immediately:
 graphify-rs build --path . --output .graphify --no-llm --update --format json,report
 ```
 
+## Optional LikeC4 architecture workspace
+
+Use this when the user wants a native architecture diagram or wants to inspect
+the graph through LikeC4:
+
+```bash
+graphify-rs build --path . --output .graphify --no-llm \
+  --format architecture,likec4 \
+  --likec4-detail architecture \
+  --service-name my-service
+cd .graphify/likec4
+npx likec4 validate
+npx likec4 start
+```
+
+Notes:
+
+- `--format architecture` writes `.graphify/architecture.json`, a compact
+  service manifest with module prefixes, capabilities/contracts, inferred capability flows, package evidence, folded
+  package dependencies, external imports, API/event/proto hints, and `contracts.provided/consumed/unresolved`.
+- `--likec4-detail architecture` uses that manifest for capability/contract-level
+  service C4. Prefer it for service/repo diagrams.
+- `balanced` keeps type-level components too; use only when the user wants that
+  detail.
+- Compose service landscapes with exact contract aliases first, then module-prefix/interface/package evidence. Use `graphify-rs compose --input svcA/.graphify/architecture.json --input svcB/.graphify/architecture.json --output .graphify/landscape` or `graphify-rs compose --discover <workspace> --output .graphify/landscape`.
+- Landscape LikeC4 renders concrete API/module-prefix dependencies, only dependency-referenced APIs, and separate operation-labelled API edges for multi-contract dependencies; package-name-only guesses stay in JSON evidence, not the visual C4.
+- Service LikeC4 workspaces emit capability-owned `api` contracts, nested `operation` elements for RPC/methods, `component` implementation modules with folded module dependencies, and `externalApi` for unresolved consumed contracts; do not convert unresolved contracts into guessed service calls.
+- Generated `.c4` files can be refreshed. Manual LikeC4 layout snapshots are
+  persisted under `.graphify/likec4/.likec4/` and must not be deleted by agents.
+- No GitHub links are emitted. Use `source_file` / `source_location` metadata
+  for private GitLab/source-host link resolution.
+
 ## Optional LLM enrichment via local CLI
 
 graphify-rs no longer requires an API key for LLM enrichment. It can call any
@@ -70,10 +102,10 @@ Short-lived HTTP MCP helper, useful in Claude Code and other terminal agents:
 ```bash
 graphifyq ensure
 graphifyq ensure --no-auto-refresh
-graphifyq query "QUESTION" --format toon
+graphifyq query "focused identifiers or subsystem" --format toon
 graphifyq summary architecture --budget 3000 --format toon
-graphifyq gc --dry-run
 graphifyq stats --format toon
+graphifyq gc --dry-run
 ```
 
 Long-lived stdio MCP server:
@@ -112,8 +144,8 @@ When invoked for a build:
 
 When answering architecture questions:
 
-- Prefer existing `.graphify/GRAPH_REPORT.md` and `graphifyq summary architecture` first.
-- Use `graphifyq query "..."` for focused questions.
+- Prefer existing `.graphify/GRAPH_REPORT.md` and `graphifyq summary architecture --budget 2000 --format toon` first.
+- Use `graphifyq query "<focused identifiers or subsystem>" --format toon` for focused questions; do not paste whole user prompts into `query`.
 - Default `graphifyq query`, `summary`, `stats`, and `tool` to `--format toon` for agent context; omit it only when the user asks for prose/human-readable text.
 - Rebuild with `graphifyq ensure` or `--no-llm --update` after meaningful code changes; use `--with-llm` only for explicit LLM refresh/enrichment.
 - Do not paste full graph JSON or full reports unless explicitly requested.

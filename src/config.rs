@@ -21,6 +21,12 @@ pub struct Config {
     pub llm: Option<bool>,
     pub llm_command: Option<String>,
     pub llm_provider: Option<String>,
+    pub service_name: Option<String>,
+    pub likec4_max_nodes: Option<usize>,
+    pub likec4_max_relations: Option<usize>,
+    pub likec4_detail: Option<String>,
+    pub likec4_include_paths: Option<Vec<String>>,
+    pub likec4_exclude_paths: Option<Vec<String>>,
 }
 
 /// Load configuration from `graphify.toml` in the given directory.
@@ -54,6 +60,12 @@ mod tests {
         assert!(cfg.llm.is_none());
         assert!(cfg.llm_command.is_none());
         assert!(cfg.llm_provider.is_none());
+        assert!(cfg.service_name.is_none());
+        assert!(cfg.likec4_max_nodes.is_none());
+        assert!(cfg.likec4_max_relations.is_none());
+        assert!(cfg.likec4_detail.is_none());
+        assert!(cfg.likec4_include_paths.is_none());
+        assert!(cfg.likec4_exclude_paths.is_none());
     }
 
     #[test]
@@ -75,6 +87,12 @@ anthropic_semantic = false
 llm = true
 llm_command = "cat"
 llm_provider = "test-cli"
+service_name = "test-service"
+likec4_max_nodes = 120
+likec4_max_relations = 90
+likec4_detail = "architecture"
+likec4_include_paths = ["cmd/", "internal/"]
+likec4_exclude_paths = ["**/*.user.js", "docs/tmp/"]
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.output.as_deref(), Some("my-output"));
@@ -92,6 +110,18 @@ llm_provider = "test-cli"
         assert_eq!(
             cfg.embedding_model.as_deref(),
             Some("minishlab/potion-code-16M")
+        );
+        assert_eq!(cfg.service_name.as_deref(), Some("test-service"));
+        assert_eq!(cfg.likec4_max_nodes, Some(120));
+        assert_eq!(cfg.likec4_max_relations, Some(90));
+        assert_eq!(cfg.likec4_detail.as_deref(), Some("architecture"));
+        assert_eq!(
+            cfg.likec4_include_paths.as_deref(),
+            Some(&["cmd/".to_string(), "internal/".to_string()][..])
+        );
+        assert_eq!(
+            cfg.likec4_exclude_paths.as_deref(),
+            Some(&["**/*.user.js".to_string(), "docs/tmp/".to_string()][..])
         );
     }
 }

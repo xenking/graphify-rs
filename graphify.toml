@@ -19,9 +19,19 @@
 # Only process code files (skip docs/papers)
 # code_only = false
 
-# Export formats (comma-separated). Available: json,html,graphml,cypher,svg,wiki,obsidian,report,context
+# Export formats (comma-separated). Available: json,html,architecture,likec4,graphml,cypher,svg,wiki,obsidian,report,context
 # Leave empty or omit for all formats.
 # formats = ["json", "html", "report"]
+
+# Logical service name for architecture manifests and LikeC4 service diagrams.
+# service_name = "my-service"
+
+# LikeC4 export controls
+# likec4_max_nodes = 250
+# likec4_max_relations = 150
+# likec4_detail = "balanced" # architecture | balanced | full
+# likec4_include_paths = ["cmd/", "internal/", "pkg/"]
+# likec4_exclude_paths = ["**/*.user.js", "docs/tmp/"]
 
 # Semantic embedding backend for --embed: model2vec, ollama, or voyage
 # embedding_provider = "model2vec"

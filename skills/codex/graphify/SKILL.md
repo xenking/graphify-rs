@@ -41,6 +41,38 @@ To force the update immediately:
 graphify-rs build --path . --output .graphify --no-llm --update --format json,report
 ```
 
+## Optional LikeC4 architecture workspace
+
+Use this when the user wants a native architecture diagram or wants to inspect
+the graph through LikeC4:
+
+```bash
+graphify-rs build --path . --output .graphify --no-llm \
+  --format architecture,likec4 \
+  --likec4-detail architecture \
+  --service-name my-service
+cd .graphify/likec4
+npx likec4 validate
+npx likec4 start
+```
+
+Notes:
+
+- `--format architecture` writes `.graphify/architecture.json`, a compact
+  service manifest with module prefixes, capabilities/contracts, inferred capability flows, package evidence, folded
+  package dependencies, external imports, API/event/proto hints, and `contracts.provided/consumed/unresolved`.
+- `--likec4-detail architecture` uses that manifest for capability/contract-level
+  service C4. Prefer it for service/repo diagrams.
+- `balanced` keeps type-level components too; use only when the user wants that
+  detail.
+- Compose service landscapes with exact contract aliases first, then module-prefix/interface/package evidence. Use `graphify-rs compose --input svcA/.graphify/architecture.json --input svcB/.graphify/architecture.json --output .graphify/landscape` or `graphify-rs compose --discover <workspace> --output .graphify/landscape`.
+- Landscape LikeC4 renders concrete API/module-prefix dependencies, only dependency-referenced APIs, and separate operation-labelled API edges for multi-contract dependencies; package-name-only guesses stay in JSON evidence, not the visual C4.
+- Service LikeC4 workspaces emit capability-owned `api` contracts, nested `operation` elements for RPC/methods, `component` implementation modules with folded module dependencies, and `externalApi` for unresolved consumed contracts; do not convert unresolved contracts into guessed service calls.
+- Generated `.c4` files can be refreshed. Manual LikeC4 layout snapshots are
+  persisted under `.graphify/likec4/.likec4/` and must not be deleted by agents.
+- No GitHub links are emitted. Use `source_file` / `source_location` metadata
+  for private GitLab/source-host link resolution.
+
 ## Optional LLM enrichment via installed Codex CLI
 
 Do not ask the user for Anthropic/OpenAI API keys just to enrich graphify.
@@ -92,7 +124,9 @@ graphifyq tool graph_stats '{}' --format toon
 ```
 
 Use graphify for architecture/codebase questions after FFF/grepai source lookup,
-not as a replacement for exact file search. Good graphify questions:
+not as a replacement for exact file search. Prefer architecture summaries for
+broad orientation and focused identifier queries for lookup; do not paste whole
+user prompts into `graphifyq query`. Good graphify questions:
 
 - "what are the main communities in this repo?"
 - "which modules bridge the data ingestion and API layers?"
@@ -112,7 +146,8 @@ Codex hook output; use `graphifyq` explicitly for graph context.
 ## Rules for agents
 
 - If `.graphify/GRAPH_REPORT.md` exists, consult it before broad architecture answers.
-- Prefer `graphifyq query` or `graphifyq summary architecture` for concise context.
+- Prefer `graphifyq summary architecture --budget 2000 --format toon` for broad context.
+- Use `graphifyq query "<focused identifiers or subsystem>" --format toon` for focused lookup.
 - Default `graphifyq query`, `summary`, `stats`, and `tool` to `--format toon` for agent context; omit it only when the user asks for prose/human-readable text.
 - Keep `.graphify/` current after meaningful code edits with `graphifyq ensure`; use `--no-llm --update` only to force an immediate rebuild without new LLM calls.
 - Use `graphifyq ensure --with-llm --llm-command "graphify-llm-codex ..."` only for explicit LLM refresh/enrichment.

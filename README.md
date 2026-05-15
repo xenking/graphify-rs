@@ -59,6 +59,23 @@ graphifyq summary architecture --format toon  # compact structured context for a
 ollama pull embeddinggemma
 graphify-rs build --no-llm --embed --embedding-provider ollama --embedding-model embeddinggemma
 VOYAGE_API_KEY=... graphify-rs build --no-llm --embed --embedding-provider voyage --embedding-model voyage-code-3
+
+# Optional capability-level architecture manifest + LikeC4 service diagram
+graphify-rs build --no-llm --format architecture,likec4 \
+  --likec4-detail architecture \
+  --service-name my-service
+cd .graphify/likec4
+npx likec4 start
+
+# Optional top-level landscape from multiple service manifests
+graphify-rs compose \
+  --input ../service-a/.graphify/architecture.json \
+  --input ../service-b/.graphify/architecture.json \
+  --output .graphify/landscape \
+  --validate --export-likec4-json
+
+# Or discover existing manifests under a workspace
+graphify-rs compose --discover ../ --output .graphify/landscape
 ```
 
 ## Performance
@@ -73,7 +90,7 @@ Rust rewrite of [graphify](https://github.com/safishamsi/graphify) (Python) — 
 | **Community detection** | Louvain | **Leiden** (with refinement) |
 | **MCP server** | - | **16 tools** over JSON-RPC 2.0 |
 | **Semantic query** | - | **Local Model2Vec index** (`--embed`; default for `graphifyq`), plus Ollama/Voyage backends |
-| **Export formats** | 7 | **10** (+ Obsidian, split HTML, LLM context pack) |
+| **Export formats** | 7 | **12** (+ Obsidian, split HTML, LLM context pack, architecture manifest, LikeC4 workspace) |
 | **Extraction** | Sequential | **Parallel** (`rayon`, configurable `-j`) |
 
 ## How It Works
@@ -91,6 +108,7 @@ Rust rewrite of [graphify](https://github.com/safishamsi/graphify) (Python) — 
                   ├── semantic-index.json local/remote semantic search index (default for graphifyq)
                   ├── LLM_CONTEXT.md      compact ranked context pack for agents
                   ├── graph.html          interactive visualization
+                  ├── likec4/             LikeC4 architecture workspace
                   ├── GRAPH_REPORT.md     analysis report
                   ├── wiki/               per-community wiki pages
                   └── obsidian/           Obsidian vault
@@ -109,6 +127,8 @@ Rust rewrite of [graphify](https://github.com/safishamsi/graphify) (Python) — 
 **Compact agent output**: `graphifyq query`, `summary`, `stats`, and raw `tool` calls support `--format text|json|toon`. Text remains the CLI default for humans; installed agent skills default their graphifyq context calls to `--format toon` and omit it only for prose/human-readable output. Use `summary architecture` for broad orientation, and keep `query` focused on exact symbols/modules instead of pasting whole user prompts.
 
 **LLM context pack**: `.graphify/LLM_CONTEXT.md` is a compact, ranked first-read artifact for agents. It boosts project docs and production entrypoints while downranking generated/minified/build/test/dependency nodes.
+
+**Architecture manifest + LikeC4 workspace**: `--format architecture` writes `.graphify/architecture.json`: a compact service architecture manifest with service name, module prefixes, capabilities/contracts, inferred capability flows, package evidence, folded package dependencies, external imports, provided/consumed API/event/proto hints, and an exact contract registry (`contracts.provided/consumed/unresolved`). `--format likec4 --likec4-detail architecture` uses that same manifest to write `.graphify/likec4/` as a capability/contract-level C4 service diagram with inferred flows, `api` elements for provided contracts nested under owning capabilities, nested `operation` elements for RPC/methods, `component` implementation modules with folded module dependencies, and `externalApi` elements for unresolved consumed contracts. LikeC4 CLI layout snapshots persist in `.graphify/likec4/.likec4/`. No GitHub links are emitted; private source hosts can resolve `source_file`/`source_location` metadata. `graphify-rs compose --input svcA/.graphify/architecture.json --input svcB/.graphify/architecture.json` or `graphify-rs compose --discover <workspace>` writes a top-level service landscape from multiple manifests using exact contract aliases first, then module-prefix/interface and package-name evidence. The landscape renders concrete API/module-prefix dependencies, shows only dependency-referenced APIs, and splits multi-contract dependencies into separate API edges with operation labels/metadata; package-name-only guesses remain in JSON evidence but are not drawn. `--validate` runs LikeC4 syntax/layout checks; `--export-likec4-json` writes a normalized LikeC4 model dump for drift checks.
 
 
 ## Ignore Rules
@@ -185,7 +205,8 @@ graphify-rs query "question" [--dfs] [--budget 2000]            # query
 graphify-rs watch --path .                                       # auto-rebuild
     graphify-rs serve                                                 # MCP stdio server
     graphify-rs serve --transport http --registry-path .graphify/.graphifyq-server.json
-    graphifyq query "where is auth wired?" --format toon               # semantic + compact agent rows; auto-refresh stale graph, reuse local HTTP sidecar
+    graphifyq summary architecture --budget 2000 --format toon         # broad agent orientation
+    graphifyq query "AuthService Database connect" --format toon        # focused semantic + graph context
 graphify-rs diff old.json new.json                               # compare
 graphify-rs stats graph.json                                     # statistics
 ```

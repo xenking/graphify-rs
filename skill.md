@@ -21,6 +21,7 @@ Turn any folder of files into a navigable knowledge graph with community detecti
 /graphify <path> --format graphml                     # export graph.graphml (Gephi, yEd)
 /graphify <path> --format cypher                      # generate .graphify/cypher.txt for Neo4j
 /graphify <path> --format svg                         # export graph.svg
+/graphify <path> --format architecture,likec4 --likec4-detail architecture  # capability-level service manifest + LikeC4
 /graphify <path> --format wiki                        # build agent-crawlable wiki
 /graphify <path> --format obsidian                    # write Obsidian vault
 /graphify query "<question>"                          # BFS traversal - broad context
@@ -85,6 +86,10 @@ Available flags:
 - `--code-only`: only process code files
 - `--update`: incremental rebuild, only re-extract changed files
 - `--format json,html,report,context,wiki,svg,graphml,cypher,obsidian`: select export formats (default: all)
+- `--format architecture`: write compact `.graphify/architecture.json` service manifest with module prefixes, capabilities/contracts, inferred capability flows, package evidence, folded package dependencies, external imports, API/event/proto hints, and `contracts.provided/consumed/unresolved`
+- `--format likec4`: write native `.graphify/likec4/` sources; `--likec4-detail architecture` uses `architecture.json` for capability/contract-level service C4 instead of package/file/type dump
+- `--likec4-max-nodes N`, `--likec4-max-relations N`: cap LikeC4 output for readable diagrams
+- `--likec4-include-path PATH`, `--likec4-exclude-path PATTERN`: narrow LikeC4 diagrams without changing the graph
 - `--jobs N`: control parallelism
 - `--max-viz-nodes N`: maximum nodes in HTML visualization (default: 2000, increase for larger projects)
 - graphify respects root `.gitignore`, `.git/info/exclude`, and `.graphifyignore`; use `.graphifyignore` `!path` rules to re-include gitignored files for graphing
@@ -94,10 +99,19 @@ Available flags:
 LLM enrichment rules for agents:
 - Default to `--no-llm` / `graphifyq ensure` unless the user explicitly asks for LLM enrichment.
 - Default agent-context `graphifyq query`, `summary`, `stats`, and `tool` calls to `--format toon`; omit it only when the user asks for prose/human-readable text.
+- Use `graphifyq summary architecture --budget 2000 --format toon` for broad orientation; use `graphifyq query "<focused identifiers or subsystem>" --format toon` for focused lookup. Do not paste whole user prompts into `query`.
 - `--no-llm` must not be treated as "delete LLM output"; graphify preserves cached LLM annotations in `.graphify/llm-cache.json`.
 - When running with `--llm-command`, graphify passes previous extraction back into the prompt for changed files, so follow-up builds are incremental/reiterative.
 - If the LLM provider/command/prompt contract changes, old LLM output is marked stale-preserved rather than silently overwritten.
 - Pass the repo or requested corpus root to `--path`; use `.graphifyignore` to narrow/re-include `src`, `bin`, docs, or generated directories.
+
+LikeC4 rules for agents:
+- Prefer `--likec4-detail architecture` for service/repo diagrams; use `balanced` only when the user wants type-level components too.
+- Use `graphify-rs compose --input svcA/.graphify/architecture.json --input svcB/.graphify/architecture.json --output .graphify/landscape` for explicit top-level service C4, or `graphify-rs compose --discover <workspace> --output .graphify/landscape` when manifests already exist under a workspace.
+- Service LikeC4 workspaces use capability-owned `api` contracts, nested `operation` elements for RPC/methods, `component` implementation modules with folded module dependencies, and `externalApi` for unresolved consumed contracts. Compose links exact contract aliases first and renders concrete API/module-prefix dependencies with operation-labelled edges; package-name-only guesses stay out of the visual C4; unresolved contracts remain visible instead of guessed.
+- Use `--validate --export-likec4-json` when the user wants a checked LikeC4 workspace and normalized model dump for drift review.
+- Generated `.graphify/likec4/*.c4` files are refreshable; LikeC4 manual layout snapshots live under `.graphify/likec4/.likec4/` and must persist across rebuilds.
+- Do not add GitHub source links to elements. Use `source_file` and `source_location` metadata so private GitLab/source hosts can resolve links externally.
 
 The command outputs progress with a progress bar and colored status messages.
 
@@ -253,8 +267,9 @@ For Codex-style short-lived calls, prefer `graphifyq`:
 ```bash
 graphifyq ensure
 graphifyq ensure --no-embed      # opt out only for strict AST-only/offline startup
-graphifyq query "where is authentication wired?" --format toon
-graphifyq query --no-embed "where is queue backpressure handled?" --format toon
+graphifyq summary architecture --budget 2000 --format toon
+graphifyq query "AuthService Database connect" --format toon
+graphifyq query --no-embed "queue backpressure handler" --format toon
 graphifyq stats --format toon
 graphifyq summary architecture --budget 3000 --format toon
 ```
