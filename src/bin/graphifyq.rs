@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const DEFAULT_REFRESH_INTERVAL_SECS: u64 = 300;
+const DEFAULT_SIDECAR_IDLE_TIMEOUT_SECS: u64 = 900;
+const BUILD_LOG_TAIL_BYTES: u64 = 32 * 1024;
+const BUILD_LOG_TAIL_LINES: usize = 80;
 
 #[derive(Parser)]
 #[command(
@@ -66,6 +70,8 @@ enum CommandKind {
         question: String,
         #[arg(long, default_value_t = 2000)]
         budget: usize,
+        #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+        format: OutputFormatArg,
         /// Ensure a semantic index exists before querying. Enabled by default; kept for compatibility.
         #[arg(long, action = ArgAction::SetTrue, conflicts_with = "no_embed")]
         embed: bool,
@@ -95,20 +101,57 @@ enum CommandKind {
         llm_provider: Option<String>,
     },
     /// Print graph statistics via the local sidecar.
-    Stats,
+    Stats {
+        #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+        format: OutputFormatArg,
+    },
     /// Generate smart graph summary via MCP.
     Summary {
         #[arg(value_enum, default_value_t = SummaryLevelArg::Community)]
         level: SummaryLevelArg,
         #[arg(long, default_value_t = 2000)]
         budget: usize,
+        #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+        format: OutputFormatArg,
     },
     /// Call a raw MCP tool: graphifyq tool <name> '{"arg":"value"}'
     Tool {
         name: String,
         #[arg(default_value = "{}")]
         arguments: String,
+        #[arg(long, value_enum, default_value_t = OutputFormatArg::Text)]
+        format: OutputFormatArg,
     },
+    /// Stop stale graphify-rs HTTP sidecars whose registry no longer points to them.
+    Gc {
+        /// Show what would be stopped without killing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop all graphify-rs HTTP sidecars, not only stale/orphan ones.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Clone, Debug, ValueEnum, Eq, PartialEq)]
+enum OutputFormatArg {
+    Text,
+    Json,
+    Toon,
+}
+
+impl OutputFormatArg {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+            Self::Toon => "toon",
+        }
+    }
+
+    fn graphify_format(&self) -> graphify_serve::GraphifyOutputFormat {
+        graphify_serve::GraphifyOutputFormat::parse(Some(self.as_str()))
+    }
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -167,31 +210,35 @@ async fn main() -> Result<()> {
                 build_llm_options(with_llm, llm_command, llm_provider),
             )
             .await?;
-            println!("{}", serde_json::to_string_pretty(&registry)?);
+            write_stdout_line(serde_json::to_string_pretty(&registry)?)?;
         }
         CommandKind::Doctor => {
             let paths = Paths::discover()?;
             match read_registry(&paths.registry_path) {
                 Ok(registry) => {
                     let health = get_json(&format!("{}/health", registry.http_url)).await;
-                    println!("registry: {}", paths.registry_path.display());
-                    println!("pid: {}", registry.pid);
-                    println!("mcp: {}", registry.mcp_url);
-                    println!("graph: {}", registry.graph_path.display());
+                    write_stdout_line(format!("registry: {}", paths.registry_path.display()))?;
+                    write_stdout_line(format!("pid: {}", registry.pid))?;
+                    write_stdout_line(format!("mcp: {}", registry.mcp_url))?;
+                    write_stdout_line(format!("graph: {}", registry.graph_path.display()))?;
                     match health {
-                        Ok(value) => println!("health: {}", serde_json::to_string_pretty(&value)?),
-                        Err(err) => println!("health: failed: {err:#}"),
+                        Ok(value) => write_stdout_line(format!(
+                            "health: {}",
+                            serde_json::to_string_pretty(&value)?
+                        ))?,
+                        Err(err) => write_stdout_line(format!("health: failed: {err:#}"))?,
                     }
                 }
                 Err(err) => {
-                    println!("registry: missing or invalid ({err:#})");
-                    println!("hint: run `graphifyq ensure`");
+                    write_stdout_line(format!("registry: missing or invalid ({err:#})"))?;
+                    write_stdout_line("hint: run `graphifyq ensure`")?;
                 }
             }
         }
         CommandKind::Query {
             question,
             budget,
+            format,
             embed,
             no_embed,
             embedding_provider,
@@ -214,12 +261,12 @@ async fn main() -> Result<()> {
             .await?;
             let response = post_json(
                 &format!("{}/graphifyq/query", registry.http_url),
-                &json!({"question": question, "budget": budget}),
+                &json!({"question": question, "budget": budget, "format": format.as_str()}),
             )
             .await?;
             print_tool_response(&response)?;
         }
-        CommandKind::Stats => {
+        CommandKind::Stats { format } => {
             let registry = ensure(
                 false,
                 false,
@@ -231,9 +278,13 @@ async fn main() -> Result<()> {
             )
             .await?;
             let response = get_json(&format!("{}/graphifyq/stats", registry.http_url)).await?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
+            print_value_response(&response, &format)?;
         }
-        CommandKind::Summary { level, budget } => {
+        CommandKind::Summary {
+            level,
+            budget,
+            format,
+        } => {
             let registry = ensure(
                 false,
                 false,
@@ -247,12 +298,16 @@ async fn main() -> Result<()> {
             let response = call_tool(
                 &registry,
                 "smart_summary",
-                json!({"level": level.as_str(), "budget": budget}),
+                json!({"level": level.as_str(), "budget": budget, "format": format.as_str()}),
             )
             .await?;
             print_tool_response(&response)?;
         }
-        CommandKind::Tool { name, arguments } => {
+        CommandKind::Tool {
+            name,
+            arguments,
+            format,
+        } => {
             let require_semantic = name == "semantic_query";
             let registry = ensure(
                 false,
@@ -266,8 +321,12 @@ async fn main() -> Result<()> {
             .await?;
             let args: Value = serde_json::from_str(&arguments)
                 .with_context(|| "tool arguments must be valid JSON")?;
+            let args = arguments_with_format(args, &format);
             let response = call_tool(&registry, &name, args).await?;
             print_tool_response(&response)?;
+        }
+        CommandKind::Gc { dry_run, all } => {
+            run_gc(dry_run, all)?;
         }
     }
 
@@ -470,9 +529,42 @@ fn run_build(
         .status()
         .context("start graphify-rs build")?;
     if !status.success() {
-        bail!("graphify-rs build failed with status {status}");
+        let tail = read_log_tail(&build_log_path)
+            .unwrap_or_else(|err| format!("(failed to read build log tail: {err:#})"));
+        bail!(
+            "graphify-rs build failed with status {status}; log: {}\n--- graphifyq build log tail ---\n{tail}",
+            build_log_path.display()
+        );
     }
     Ok(())
+}
+
+fn read_log_tail(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let start = len.saturating_sub(BUILD_LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("seek {}", path.display()))?;
+
+    let mut content = String::new();
+    file.read_to_string(&mut content)
+        .with_context(|| format!("read {}", path.display()))?;
+    if start > 0
+        && let Some(first_newline) = content.find('\n')
+    {
+        content = content[(first_newline + 1)..].to_string();
+    }
+
+    let mut lines = content
+        .lines()
+        .rev()
+        .take(BUILD_LOG_TAIL_LINES)
+        .collect::<Vec<_>>();
+    lines.reverse();
+    Ok(lines.join("\n"))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -607,6 +699,8 @@ fn start_sidecar(paths: &Paths) -> Result<()> {
         .arg(&paths.registry_path)
         .arg("--graph")
         .arg(&paths.graph_path)
+        .arg("--idle-timeout-secs")
+        .arg(DEFAULT_SIDECAR_IDLE_TIMEOUT_SECS.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
@@ -655,6 +749,132 @@ fn terminate_process(pid: u32) -> Result<()> {
             .context("terminate graphify-rs sidecar")?;
     }
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SidecarProcess {
+    pid: u32,
+    registry_path: Option<PathBuf>,
+}
+
+fn run_gc(dry_run: bool, all: bool) -> Result<()> {
+    let sidecars = collect_sidecars()?;
+    let mut selected = Vec::new();
+    for sidecar in sidecars {
+        if all || sidecar_is_stale(&sidecar) {
+            selected.push(sidecar);
+        }
+    }
+
+    for sidecar in &selected {
+        let registry = sidecar
+            .registry_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<missing registry-path>".to_string());
+        let action = if dry_run { "would stop" } else { "stopping" };
+        write_stdout_line(format!("{action} pid={} registry={registry}", sidecar.pid))?;
+        if !dry_run {
+            terminate_process(sidecar.pid)?;
+        }
+    }
+
+    write_stdout_line(format!(
+        "{} {} sidecar(s)",
+        if dry_run { "matched" } else { "stopped" },
+        selected.len()
+    ))?;
+    Ok(())
+}
+
+fn collect_sidecars() -> Result<Vec<SidecarProcess>> {
+    #[cfg(not(unix))]
+    {
+        Ok(Vec::new())
+    }
+    #[cfg(unix)]
+    {
+        let output = Command::new("ps")
+            .args(["-axo", "pid=,command="])
+            .output()
+            .context("list graphify-rs sidecars")?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        Ok(text.lines().filter_map(parse_sidecar_ps_line).collect())
+    }
+}
+
+fn parse_sidecar_ps_line(line: &str) -> Option<SidecarProcess> {
+    let trimmed = line.trim_start();
+    let mut fields = trimmed.splitn(2, char::is_whitespace);
+    let pid = fields.next()?;
+    let command = fields.next()?.trim_start();
+    let pid = pid.parse().ok()?;
+    let mut command_parts = command.split_whitespace();
+    let executable = command_parts.next()?;
+    let subcommand = command_parts.next()?;
+    if !is_graphify_rs_executable(executable) || subcommand != "serve" {
+        return None;
+    }
+    if flag_value(command, "--transport").as_deref() != Some("http") {
+        return None;
+    }
+    Some(SidecarProcess {
+        pid,
+        registry_path: flag_value(command, "--registry-path").map(PathBuf::from),
+    })
+}
+
+fn is_graphify_rs_executable(executable: &str) -> bool {
+    matches!(
+        Path::new(executable)
+            .file_name()
+            .and_then(|name| name.to_str()),
+        Some("graphify-rs" | "graphify-rs.exe")
+    )
+}
+
+fn sidecar_is_stale(sidecar: &SidecarProcess) -> bool {
+    let Some(registry_path) = &sidecar.registry_path else {
+        return false;
+    };
+    match read_registry(registry_path) {
+        Ok(registry) => registry.pid != sidecar.pid,
+        Err(_) => true,
+    }
+}
+
+fn flag_value(command: &str, flag: &str) -> Option<String> {
+    let mut parts = command.split_whitespace();
+    while let Some(part) = parts.next() {
+        if part == flag {
+            return collect_flag_value(&mut parts);
+        }
+        if let Some(value) = part.strip_prefix(&format!("{flag}=")) {
+            let mut values = vec![value.to_string()];
+            for next in parts.by_ref() {
+                if next.starts_with("--") {
+                    break;
+                }
+                values.push(next.to_string());
+            }
+            return Some(values.join(" "));
+        }
+    }
+    None
+}
+
+fn collect_flag_value<'a, I>(parts: &mut I) -> Option<String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut values = Vec::new();
+    for part in parts.by_ref() {
+        if part.starts_with("--") {
+            break;
+        }
+        values.push(part.to_string());
+    }
+    (!values.is_empty()).then(|| values.join(" "))
 }
 
 async fn wait_for_registry(path: &Path, require_semantic: bool) -> Result<Registry> {
@@ -722,16 +942,42 @@ fn print_tool_response(response: &Value) -> Result<()> {
     if let Some(content) = response["result"]["content"].as_array() {
         for item in content {
             if let Some(text) = item["text"].as_str() {
-                println!("{text}");
+                write_stdout_line(text)?;
             }
         }
         if response["result"]["isError"].as_bool().unwrap_or(false) {
             std::process::exit(2);
         }
     } else {
-        println!("{}", serde_json::to_string_pretty(response)?);
+        write_stdout_line(serde_json::to_string_pretty(response)?)?;
     }
     Ok(())
+}
+
+fn print_value_response(response: &Value, format: &OutputFormatArg) -> Result<()> {
+    let formatted = graphify_serve::format_value(response, format.graphify_format())
+        .map_err(anyhow::Error::msg)?;
+    write_stdout_line(formatted)?;
+    Ok(())
+}
+
+fn write_stdout_line(text: impl AsRef<str>) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    match writeln!(stdout, "{}", text.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == ErrorKind::BrokenPipe => std::process::exit(0),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn arguments_with_format(mut args: Value, format: &OutputFormatArg) -> Value {
+    if format == &OutputFormatArg::Text {
+        return args;
+    }
+    if let Some(object) = args.as_object_mut() {
+        object.insert("format".to_string(), json!(format.as_str()));
+    }
+    args
 }
 
 fn graphify_rs_exe() -> PathBuf {
@@ -782,6 +1028,28 @@ mod tests {
         assert_eq!(SummaryLevelArg::Detailed.as_str(), "detailed");
         assert_eq!(SummaryLevelArg::Community.as_str(), "community");
         assert_eq!(SummaryLevelArg::Architecture.as_str(), "architecture");
+    }
+
+    #[test]
+    fn output_format_arg_serializes_to_tool_values() {
+        assert_eq!(OutputFormatArg::Text.as_str(), "text");
+        assert_eq!(OutputFormatArg::Json.as_str(), "json");
+        assert_eq!(OutputFormatArg::Toon.as_str(), "toon");
+    }
+
+    #[test]
+    fn arguments_with_format_preserves_text_default() {
+        let args = json!({"top_n": 2});
+        assert_eq!(
+            arguments_with_format(args.clone(), &OutputFormatArg::Text),
+            args
+        );
+    }
+
+    #[test]
+    fn arguments_with_format_injects_toon() {
+        let args = arguments_with_format(json!({"top_n": 2}), &OutputFormatArg::Toon);
+        assert_eq!(args["format"], "toon");
     }
 
     #[test]
@@ -874,6 +1142,98 @@ mod tests {
             301_000
         ));
         assert!(!should_auto_refresh(false, &state_path, refresh, 301_000));
+    }
+
+    #[test]
+    fn read_log_tail_keeps_recent_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("graphifyq-build.log");
+        let content = (0..100)
+            .map(|line| format!("line-{line}\n"))
+            .collect::<String>();
+        fs::write(&log_path, content).unwrap();
+
+        let tail = read_log_tail(&log_path).unwrap();
+
+        assert!(tail.starts_with("line-20\n"));
+        assert!(tail.contains("line-99"));
+        assert!(!tail.contains("line-19\n"));
+    }
+
+    #[test]
+    fn parse_sidecar_ps_line_extracts_registry() {
+        let line = " 123 /Users/me/.cargo/bin/graphify-rs serve --transport http --registry-path /tmp/proj/.graphify/.graphifyq-server.json --graph /tmp/proj/.graphify/graph.json";
+
+        let sidecar = parse_sidecar_ps_line(line).unwrap();
+
+        assert_eq!(sidecar.pid, 123);
+        assert_eq!(
+            sidecar.registry_path,
+            Some(PathBuf::from("/tmp/proj/.graphify/.graphifyq-server.json"))
+        );
+    }
+
+    #[test]
+    fn parse_sidecar_ps_line_ignores_shell_wrappers() {
+        let line =
+            " 123 /bin/zsh -c graphify-rs serve --registry-path /tmp/not-a-real-sidecar.json";
+
+        assert_eq!(parse_sidecar_ps_line(line), None);
+    }
+
+    #[test]
+    fn parse_sidecar_ps_line_ignores_executable_suffix_traps() {
+        let line = " 123 /tmp/notgraphify-rs serve --registry-path /tmp/not-a-real-sidecar.json";
+
+        assert_eq!(parse_sidecar_ps_line(line), None);
+    }
+
+    #[test]
+    fn parse_sidecar_ps_line_ignores_stdio_servers() {
+        let line = " 123 /Users/me/.cargo/bin/graphify-rs serve --transport stdio";
+
+        assert_eq!(parse_sidecar_ps_line(line), None);
+    }
+
+    #[test]
+    fn parse_sidecar_ps_line_includes_registryless_http_sidecars() {
+        let line =
+            " 123 /Users/me/.cargo/bin/graphify-rs serve --transport http --http-bind 127.0.0.1:0";
+
+        let sidecar = parse_sidecar_ps_line(line).unwrap();
+
+        assert_eq!(sidecar.pid, 123);
+        assert_eq!(sidecar.registry_path, None);
+        assert!(!sidecar_is_stale(&sidecar));
+    }
+
+    #[test]
+    fn flag_value_supports_equals_and_split_forms() {
+        assert_eq!(
+            flag_value(
+                "graphify-rs serve --registry-path /tmp/a",
+                "--registry-path"
+            ),
+            Some("/tmp/a".to_string())
+        );
+        assert_eq!(
+            flag_value(
+                "graphify-rs serve --registry-path=/tmp/b",
+                "--registry-path"
+            ),
+            Some("/tmp/b".to_string())
+        );
+    }
+
+    #[test]
+    fn flag_value_preserves_spaced_paths_until_next_flag() {
+        assert_eq!(
+            flag_value(
+                "graphify-rs serve --registry-path /tmp/my project/.graphify/server.json --graph /tmp/my project/.graphify/graph.json",
+                "--registry-path",
+            ),
+            Some("/tmp/my project/.graphify/server.json".to_string())
+        );
     }
 
     #[test]

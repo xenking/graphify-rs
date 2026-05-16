@@ -70,7 +70,6 @@ fn rebuild(
 ) -> Result<(), WatchError> {
     let cache_dir = output_dir.join("cache");
 
-    // ── Step 0: Invalidate cache for changed files ──
     if let Some(changed) = changed_files {
         for path in changed {
             let _ = graphify_cache::invalidate_cached(path, root, &cache_dir);
@@ -81,7 +80,6 @@ fn rebuild(
         );
     }
 
-    // ── Step 1: Detect files ──
     info!("rebuild: detecting files...");
     let detection = graphify_detect::detect(root);
     info!(
@@ -89,7 +87,6 @@ fn rebuild(
         detection.total_files, detection.total_words
     );
 
-    // ── Step 2: Extract AST ──
     let code_files: Vec<PathBuf> = detection
         .files
         .get(&graphify_detect::FileType::Code)
@@ -119,20 +116,16 @@ fn rebuild(
             ast_result.hyperedges.extend(cached.hyperedges);
             continue;
         }
-        // Extract fresh, catching panics
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(fresh) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             graphify_extract::extract(std::slice::from_ref(file_path))
         })) {
-            Ok(fresh) => {
-                let _ = graphify_cache::save_cached_to(file_path, &fresh, root, &cache_dir);
-                ast_result.nodes.extend(fresh.nodes);
-                ast_result.edges.extend(fresh.edges);
-                ast_result.hyperedges.extend(fresh.hyperedges);
-            }
-            Err(_) => {
-                errors += 1;
-                warn!("rebuild: extraction panicked for {}", file_path.display());
-            }
+            let _ = graphify_cache::save_cached_to(file_path, &fresh, root, &cache_dir);
+            ast_result.nodes.extend(fresh.nodes);
+            ast_result.edges.extend(fresh.edges);
+            ast_result.hyperedges.extend(fresh.hyperedges);
+        } else {
+            errors += 1;
+            warn!("rebuild: extraction panicked for {}", file_path.display());
         }
     }
     if cache_hits > 0 {
@@ -153,7 +146,6 @@ fn rebuild(
 
     let extractions = vec![ast_result];
 
-    // ── Step 3: Build graph ──
     info!("rebuild: building graph...");
     let graph = graphify_build::build(&extractions)
         .map_err(|e| WatchError::Rebuild(format!("build failed: {e}")))?;
@@ -163,7 +155,6 @@ fn rebuild(
         graph.edge_count()
     );
 
-    // ── Step 4: Cluster ──
     info!("rebuild: detecting communities...");
     let communities = graphify_cluster::cluster(&graph);
     let cohesion = graphify_cluster::score_all(&graph, &communities);
@@ -174,20 +165,17 @@ fn rebuild(
             let label = nodes
                 .first()
                 .and_then(|id| graph.get_node(id))
-                .map(|n| n.label.clone())
-                .unwrap_or_else(|| format!("Community {}", cid));
+                .map_or_else(|| format!("Community {cid}"), |n| n.label.clone());
             (*cid, label)
         })
         .collect();
     info!("rebuild: {} communities detected", communities.len());
 
-    // ── Step 5: Analyze ──
     info!("rebuild: analyzing...");
     let god_list = graphify_analyze::god_nodes(&graph, 10);
     let surprise_list = graphify_analyze::surprising_connections(&graph, &communities, 5);
     let questions = graphify_analyze::suggest_questions(&graph, &communities, &community_labels, 7);
 
-    // ── Step 6: Export all formats ──
     std::fs::create_dir_all(output_dir)
         .map_err(|e| WatchError::Rebuild(format!("create output dir: {e}")))?;
 
@@ -198,20 +186,11 @@ fn rebuild(
     let _ = graphify_export::export_svg(&graph, &communities, output_dir);
     let _ = graphify_export::export_wiki(&graph, &communities, &community_labels, output_dir);
 
-    // Report
     let detection_json = serde_json::json!({
         "total_files": detection.total_files,
         "total_words": detection.total_words,
         "warning": detection.warning,
     });
-    let god_json: Vec<serde_json::Value> = god_list
-        .iter()
-        .map(|g| serde_json::json!({"label": g.label, "edges": g.degree}))
-        .collect();
-    let surprise_json: Vec<serde_json::Value> = surprise_list
-        .iter()
-        .map(|s| serde_json::to_value(s).unwrap_or_default())
-        .collect();
     let question_json: Vec<serde_json::Value> = questions
         .iter()
         .map(|q| serde_json::to_value(q).unwrap_or_default())
@@ -220,30 +199,24 @@ fn rebuild(
         HashMap::from([("input".to_string(), 0), ("output".to_string(), 0)]);
 
     let root_str = root.to_string_lossy();
-    let report = graphify_export::generate_report(
-        &graph,
-        &communities,
-        &cohesion,
-        &community_labels,
-        &god_json,
-        &surprise_json,
-        &detection_json,
-        &token_cost,
-        &root_str,
-        Some(&question_json),
-    );
-    let report_path = output_dir.join("GRAPH_REPORT.md");
-    let _ = std::fs::write(&report_path, &report);
+    if let Ok(report) = graphify_export::generate_report(&graphify_export::ReportInput {
+        graph: &graph,
+        communities: &communities,
+        cohesion_scores: &cohesion,
+        community_labels: &community_labels,
+        god_nodes: &god_list,
+        surprises: &surprise_list,
+        detection_result: &detection_json,
+        token_cost: &token_cost,
+        root: &root_str,
+        suggested_questions: Some(&question_json),
+    }) {
+        let report_path = output_dir.join("GRAPH_REPORT.md");
+        let _ = std::fs::write(&report_path, &report);
+    }
 
-    // Save manifest
     let manifest_path = output_dir.join(".graphify_manifest.json");
-    let manifest = graphify_detect::Manifest {
-        files: detection
-            .files
-            .iter()
-            .flat_map(|(ft, paths)| paths.iter().map(move |p| (p.clone(), *ft)))
-            .collect(),
-    };
+    let manifest = graphify_detect::manifest_from_detection(root, &detection);
     let _ = graphify_detect::save_manifest(&manifest_path, &manifest);
 
     info!("rebuild: done");
@@ -287,11 +260,13 @@ pub async fn watch_directory(root: &Path, output_dir: &Path) -> Result<(), Watch
     );
     println!("Watching {} for changes...", root.display());
 
-    // Run initial build (full)
     println!("Running initial build...");
-    match rebuild(root, output_dir, None) {
-        Ok(()) => println!("Initial build complete."),
-        Err(e) => eprintln!("Initial build failed: {e}"),
+    let root_clone = root.to_path_buf();
+    let out_clone = output_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || rebuild(&root_clone, &out_clone, None)).await {
+        Ok(Ok(())) => println!("Initial build complete."),
+        Ok(Err(e)) => eprintln!("Initial build failed: {e}"),
+        Err(e) => eprintln!("Initial build panicked: {e}"),
     }
 
     while let Some(changed_paths) = rx.recv().await {
@@ -312,22 +287,19 @@ pub async fn watch_directory(root: &Path, output_dir: &Path) -> Result<(), Watch
             debug!("  changed: {}", p.display());
         }
 
-        match rebuild(root, output_dir, Some(&relevant)) {
-            Ok(()) => {
-                println!("Rebuild complete.");
-            }
-            Err(e) => {
-                eprintln!("Rebuild failed: {e}");
-            }
+        let root_clone = root.to_path_buf();
+        let out_clone = output_dir.to_path_buf();
+        match tokio::task::spawn_blocking(move || rebuild(&root_clone, &out_clone, Some(&relevant)))
+            .await
+        {
+            Ok(Ok(())) => println!("Rebuild complete."),
+            Ok(Err(e)) => eprintln!("Rebuild failed: {e}"),
+            Err(e) => eprintln!("Rebuild panicked: {e}"),
         }
     }
 
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -385,7 +357,6 @@ mod tests {
     fn test_rebuild_empty_dir() {
         let dir = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
-        // Should succeed with empty directory (no code files)
         let result = rebuild(dir.path(), output.path(), None);
         assert!(result.is_ok());
     }
@@ -410,10 +381,20 @@ mod tests {
         let result = rebuild(dir.path(), output.path(), None);
         assert!(result.is_ok());
 
-        // Check that output files were created
         assert!(output.path().join("graph.json").exists());
         assert!(output.path().join("graph.html").exists());
         assert!(output.path().join("GRAPH_REPORT.md").exists());
+        let manifest =
+            graphify_detect::load_manifest(&output.path().join(".graphify_manifest.json"))
+                .expect("manifest should be saved");
+        assert_eq!(
+            manifest.hashes.get("src/main.rs"),
+            graphify_cache::file_hash(&src.join("main.rs")).as_ref()
+        );
+        assert_eq!(
+            manifest.hashes.get("src/lib.rs"),
+            graphify_cache::file_hash(&src.join("lib.rs")).as_ref()
+        );
     }
 
     #[test]
@@ -428,11 +409,9 @@ mod tests {
         )
         .unwrap();
 
-        // Initial full build
         let result = rebuild(dir.path(), output.path(), None);
         assert!(result.is_ok());
 
-        // Incremental rebuild with changed files
         let changed = vec![src.join("main.rs")];
         let result = rebuild(dir.path(), output.path(), Some(&changed));
         assert!(result.is_ok());

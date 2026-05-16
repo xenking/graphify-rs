@@ -1,17 +1,14 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 
 use petgraph::Undirected;
 use petgraph::stable_graph::{NodeIndex, StableGraph};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
 use crate::error::{GraphifyError, Result};
 use crate::model::{CommunityInfo, GraphEdge, GraphNode, Hyperedge};
-
-// ---------------------------------------------------------------------------
-// KnowledgeGraph
-// ---------------------------------------------------------------------------
 
 /// A knowledge graph backed by `petgraph::StableGraph`.
 ///
@@ -23,6 +20,14 @@ pub struct KnowledgeGraph {
     index_map: HashMap<String, NodeIndex>,
     pub communities: Vec<CommunityInfo>,
     pub hyperedges: Vec<Hyperedge>,
+}
+
+#[derive(Deserialize)]
+struct NodeLinkData {
+    #[serde(default)]
+    nodes: Vec<GraphNode>,
+    #[serde(default)]
+    links: Vec<GraphEdge>,
 }
 
 impl Default for KnowledgeGraph {
@@ -40,8 +45,6 @@ impl KnowledgeGraph {
             hyperedges: Vec::new(),
         }
     }
-
-    // -- Mutation --------------------------------------------------------
 
     /// Add a node. Returns an error if a node with the same `id` already exists.
     pub fn add_node(&mut self, node: GraphNode) -> Result<NodeIndex> {
@@ -67,8 +70,6 @@ impl KnowledgeGraph {
         self.graph.add_edge(src, tgt, edge);
         Ok(())
     }
-
-    // -- Query -----------------------------------------------------------
 
     pub fn get_node(&self, id: &str) -> Option<&GraphNode> {
         self.index_map
@@ -116,8 +117,7 @@ impl KnowledgeGraph {
     pub fn degree(&self, id: &str) -> usize {
         self.index_map
             .get(id)
-            .map(|&idx| self.graph.edges(idx).count())
-            .unwrap_or(0)
+            .map_or(0, |&idx| self.graph.edges(idx).count())
     }
 
     /// Get neighbor IDs as strings.
@@ -158,8 +158,6 @@ impl KnowledgeGraph {
             .collect()
     }
 
-    // -- Serialization ---------------------------------------------------
-
     /// Serialize to the NetworkX `node_link_data` JSON format.
     pub fn to_node_link_json(&self) -> Value {
         let nodes: Vec<Value> = self
@@ -191,9 +189,10 @@ impl KnowledgeGraph {
 
     /// Stream the graph as NetworkX `node_link_data` JSON directly to a writer.
     ///
-    /// Unlike `to_node_link_json()`, this avoids building the entire JSON tree
-    /// in memory. For a 50K-node graph this saves ~500 MB of intermediate
-    /// allocations.
+    /// Serialize to the NetworkX `node_link_data` JSON format, writing to
+    /// the provided writer. Uses a streaming serializer to avoid building
+    /// an intermediate JSON Value tree, but still collects node/edge
+    /// references into a Vec for serialization.
     pub fn write_node_link_json<W: Write>(&self, writer: W) -> serde_json::Result<()> {
         use serde::ser::SerializeMap;
         use serde_json::ser::{PrettyFormatter, Serializer};
@@ -206,7 +205,6 @@ impl KnowledgeGraph {
         map.serialize_entry("multigraph", &false)?;
         map.serialize_entry("graph", &serde_json::Map::new())?;
 
-        // Stream nodes one by one
         let nodes: Vec<&GraphNode> = self
             .graph
             .node_indices()
@@ -214,7 +212,6 @@ impl KnowledgeGraph {
             .collect();
         map.serialize_entry("nodes", &nodes)?;
 
-        // Stream edges one by one
         let links: Vec<&GraphEdge> = self
             .graph
             .edge_indices()
@@ -227,37 +224,44 @@ impl KnowledgeGraph {
 
     /// Deserialize from the NetworkX `node_link_data` JSON format.
     pub fn from_node_link_json(value: &Value) -> Result<Self> {
+        let nodes = value
+            .get("nodes")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .map(|v| serde_json::from_value(v.clone()).map_err(GraphifyError::SerializationError))
+            .collect::<Result<Vec<GraphNode>>>()?;
+        let links = value
+            .get("links")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .map(|v| serde_json::from_value(v.clone()).map_err(GraphifyError::SerializationError))
+            .collect::<Result<Vec<GraphEdge>>>()?;
+        Self::from_node_link_parts(nodes, links)
+    }
+
+    /// Deserialize a NetworkX `node_link_data` JSON graph from a reader.
+    pub fn from_node_link_reader<R: Read>(reader: R) -> Result<Self> {
+        let data: NodeLinkData = serde_json::from_reader(reader)?;
+        Self::from_node_link_parts(data.nodes, data.links)
+    }
+
+    fn from_node_link_parts(nodes: Vec<GraphNode>, links: Vec<GraphEdge>) -> Result<Self> {
         let mut kg = Self::new();
-
-        // Nodes
-        if let Some(nodes) = value.get("nodes").and_then(|v| v.as_array()) {
-            for nv in nodes {
-                let node: GraphNode = serde_json::from_value(nv.clone())
-                    .map_err(GraphifyError::SerializationError)?;
-                if let Err(e) = kg.add_node(node) {
-                    warn!("skipping node during import: {e}");
-                }
+        for node in nodes {
+            if let Err(e) = kg.add_node(node) {
+                warn!("skipping node during import: {e}");
             }
         }
-
-        // Edges (field name is "links" in node_link_data)
-        if let Some(links) = value.get("links").and_then(|v| v.as_array()) {
-            for lv in links {
-                let edge: GraphEdge = serde_json::from_value(lv.clone())
-                    .map_err(GraphifyError::SerializationError)?;
-                if let Err(e) = kg.add_edge(edge) {
-                    warn!("skipping edge during import: {e}");
-                }
+        for edge in links {
+            if let Err(e) = kg.add_edge(edge) {
+                warn!("skipping edge during import: {e}");
             }
         }
-
         Ok(kg)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -342,7 +346,6 @@ mod tests {
         assert!(json["nodes"].as_array().unwrap().len() == 2);
         assert!(json["links"].as_array().unwrap().len() == 1);
 
-        // Reconstruct
         let kg2 = KnowledgeGraph::from_node_link_json(&json).unwrap();
         assert_eq!(kg2.node_count(), 2);
         assert_eq!(kg2.edge_count(), 1);
@@ -392,12 +395,10 @@ mod tests {
         kg.add_node(make_node("b")).unwrap();
         kg.add_edge(make_edge("a", "b")).unwrap();
 
-        // Streaming write to buffer
         let mut buf = Vec::new();
         kg.write_node_link_json(&mut buf).unwrap();
         let streamed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
 
-        // In-memory build
         let in_mem = kg.to_node_link_json();
 
         assert_eq!(streamed["directed"], in_mem["directed"]);
@@ -410,6 +411,24 @@ mod tests {
             streamed["links"].as_array().unwrap().len(),
             in_mem["links"].as_array().unwrap().len()
         );
+    }
+
+    #[test]
+    fn from_node_link_reader_matches_value_import() {
+        let mut kg = KnowledgeGraph::new();
+        kg.add_node(make_node("a")).unwrap();
+        kg.add_node(make_node("b")).unwrap();
+        kg.add_edge(make_edge("a", "b")).unwrap();
+        let json = kg.to_node_link_json();
+        let bytes = serde_json::to_vec(&json).unwrap();
+
+        let from_reader = KnowledgeGraph::from_node_link_reader(bytes.as_slice()).unwrap();
+        let from_value = KnowledgeGraph::from_node_link_json(&json).unwrap();
+
+        assert_eq!(from_reader.node_count(), from_value.node_count());
+        assert_eq!(from_reader.edge_count(), from_value.edge_count());
+        assert!(from_reader.get_node("a").is_some());
+        assert!(from_reader.get_node("b").is_some());
     }
 
     #[test]

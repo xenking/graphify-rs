@@ -253,6 +253,7 @@ Start the MCP (Model Context Protocol) server over JSON-RPC 2.0. Stdio remains t
 | `--http-bind <ADDR>` | `String` | `"127.0.0.1:0"` | HTTP bind address when `--transport=http`. |
 | `--http-path <PATH>` | `String` | `"/mcp"` | HTTP MCP endpoint path. |
 | `--registry-path <PATH>` | `String` | unset | Optional JSON registry written after binding; used by `graphifyq`. |
+| `--idle-timeout-secs <N>` | `u64` | unset | HTTP-only idle exit timeout. `graphifyq` sidecars pass `900` by default. |
 
 #### Available MCP Tools
 
@@ -299,18 +300,24 @@ graphifyq ensure                         # semantic index is built by default; s
 graphifyq ensure --no-embed              # opt out for strict AST-only/offline startup
 graphifyq ensure --no-auto-refresh       # read-only sidecar startup; never rebuild an existing graph
 graphifyq ensure --refresh-interval-secs 60
-graphifyq query "how does auth work?"     # semantic query context by default
-graphifyq query --no-embed "where is queue backpressure handled?"
-graphifyq stats
-graphifyq summary architecture --budget 3000
-graphifyq tool pagerank '{"top_n": 20}'
+graphifyq query "how does auth work?" --format toon     # default for agent context
+graphifyq query --no-embed "where is queue backpressure handled?" --format toon
+graphifyq stats --format toon
+graphifyq summary architecture --budget 3000 --format toon
+graphifyq tool pagerank '{"top_n": 20}' --format toon
+graphifyq tool god_nodes '{"top_n": 20}' --format toon
+graphifyq gc --dry-run                  # show stale/orphan sidecars
+graphifyq gc                            # stop stale/orphan sidecars only
 ```
 
 `graphifyq` records its per-repo refresh state in `.graphify/.graphifyq-refresh.json`.
 When the interval expires it runs `graphify-rs build --path . --output .graphify --no-llm --update`
 and includes `--embed` when semantic search is enabled (the default for `ensure` and `query`).
+Use `--format toon` by default for agent context; text remains the CLI default for humans.
 If a local HTTP sidecar is already running, graphifyq terminates and restarts it after refresh
 so subsequent MCP/query calls load the new graph.
+HTTP sidecars started by `graphifyq` exit after 900 idle seconds. Semantic indexes and encoders
+are loaded lazily on the first semantic query rather than at server startup.
 
 ---
 
@@ -782,11 +789,12 @@ These platforms use a generic integration that only writes the `## graphify` sec
 
 Once installed, the agent follows these rules (injected into `CLAUDE.md` or `AGENTS.md`):
 
-1. **Before answering architecture or codebase questions** — prefer `graphifyq query "<question>"`; it uses the local Model2Vec semantic index by default and auto-refreshes stale graphs every 300s.
+1. **Before answering architecture or codebase questions** — prefer `graphifyq query "<question>" --format toon`; it uses the local Model2Vec semantic index by default and auto-refreshes stale graphs every 300s.
 2. **For broad orientation** — read `.graphify/GRAPH_REPORT.md` for god nodes and community structure.
 3. **If `.graphify/wiki/index.md` exists** — navigate the wiki instead of reading raw files.
-4. **For strict AST-only/offline startup** — pass `--no-embed` to `graphifyq ensure/query`.
-5. **After modifying code files** — run `graphifyq ensure` to keep graph.json and semantic-index.json current; force `graphify-rs build --path . --output .graphify --no-llm --update --embed` only when an immediate rebuild is required.
+4. **For graphifyq agent context** — default `query`, `summary`, `stats`, and `tool` to `--format toon`; omit it only when the user asks for prose/human-readable text.
+5. **For strict AST-only/offline startup** — pass `--no-embed` to `graphifyq ensure/query`.
+6. **After modifying code files** — run `graphifyq ensure` to keep graph.json and semantic-index.json current; force `graphify-rs build --path . --output .graphify --no-llm --update --embed` only when an immediate rebuild is required.
 
 The `PreToolUse` hook automatically fires when the agent uses `Glob` or `Grep` tools (Claude/CodeBuddy) or `Bash` (Codex), injecting a reminder to check the graph first.
 

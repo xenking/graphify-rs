@@ -52,7 +52,12 @@ graphify-rs query "how does auth work?"
 # Model2Vec semantic search is on by default; graphifyq auto-refreshes stale graphs every 300s.
 # Use --no-embed for fast/offline AST-only mode or --no-auto-refresh for read-only checks.
 graphifyq ensure
-graphifyq query "how does auth work?"
+graphifyq query "how does auth work?" --format toon
+graphifyq summary architecture --format toon  # compact structured context for agents
+
+# (Optional) Add semantic extraction via LLM
+export ANTHROPIC_API_KEY=sk-...   # or configure [llm] in graphify.toml
+graphify-rs build
 
 # Optional embedding backends
 ollama pull embeddinggemma
@@ -99,11 +104,15 @@ Rust rewrite of [graphify](https://github.com/safishamsi/graphify) (Python) — 
 
 **Pass 1b — Local document context** (free, no API key): Markdown/RST/text docs are indexed into concept nodes so README/PRODUCT/planning docs can anchor LLM context even with `--no-llm`.
 
+**Pass 2 — Semantic extraction** (optional, `--no-llm` to skip): LLM API (Anthropic, OpenAI, Ollama, or OpenAI-compatible) discovers conceptual links, shared assumptions, design rationale. Edges tagged `INFERRED` (confidence 0.4–0.9). Configure via `[llm]` in `graphify.toml`.
+
 **Optional legacy Anthropic extraction** (`--anthropic-semantic`): Claude API concept extraction remains available only by explicit opt-in and requires `ANTHROPIC_API_KEY`. Default builds do not ask for Anthropic keys.
 
 **Optional external LLM CLI extraction** (`--llm-command`): graphify can call an installed local CLI instead of requiring an API key. The command receives a strict semantic-extraction prompt on stdin and must print JSON with `entities` and `relationships` to stdout. The bundled `graphify-llm-codex` adapter makes installed Codex CLI usable directly, for example `--llm-command "graphify-llm-codex --model gpt-5.4-mini" --llm-provider codex-cli`. Results are stored under `.graphify/llm-cache/<provider>/` with provider/command/prompt metadata; `--no-llm` rebuilds preserve cached LLM enrichments in `graph.json`, and later LLM runs reuse unchanged file caches while passing previous per-path output back into the prompt for changed files.
 
-**Semantic query index** (`--embed`, default for `graphifyq ensure/query`): embeddings are stored in `.graphify/semantic-index.json` so `query_graph` / `semantic_query` can rank graph nodes by natural-language meaning before returning relationship-aware graph context. Default backend is local Model2Vec. `--embedding-provider ollama` uses Ollama `/api/embed`; `--embedding-provider voyage` uses Voyage embeddings with `VOYAGE_API_KEY`. `graphifyq` also keeps per-repo graphs fresh with a 300s TTL by running `graphify-rs build --path . --output .graphify --no-llm --update --embed` when stale, then restarting its local HTTP sidecar so queries see the new graph. Use `graphifyq ensure --no-embed` or `graphifyq query --no-embed ...` when you explicitly need AST-only/offline startup; use `--no-auto-refresh` for read-only checks.
+**Semantic query index** (`--embed`, default for `graphifyq ensure/query`): embeddings are stored in `.graphify/semantic-index.json` so `query_graph` / `semantic_query` can rank graph nodes by natural-language meaning before returning relationship-aware graph context. Default backend is local Model2Vec. `--embedding-provider ollama` uses Ollama `/api/embed`; `--embedding-provider voyage` uses Voyage embeddings with `VOYAGE_API_KEY`. `graphifyq` also keeps per-repo graphs fresh with a 300s TTL by running `graphify-rs build --path . --output .graphify --no-llm --update --embed` when stale, then restarting its local HTTP sidecar so queries see the new graph. `graphifyq` sidecars exit after 900 idle seconds, and semantic indexes/encoders load lazily on first semantic query. Use `graphifyq ensure --no-embed` or `graphifyq query --no-embed ...` when you explicitly need AST-only/offline startup; use `--no-auto-refresh` for read-only checks. Use `graphifyq gc` to stop stale/orphan sidecars.
+
+**Compact agent output**: `graphifyq query`, `summary`, `stats`, and raw `tool` calls support `--format text|json|toon`. Text remains the CLI default for humans; installed agent skills default their graphifyq context calls to `--format toon` and omit it only for prose/human-readable output. Use `summary architecture` for broad orientation, and keep `query` focused on exact symbols/modules instead of pasting whole user prompts.
 
 **LLM context pack**: `.graphify/LLM_CONTEXT.md` is a compact, ranked first-read artifact for agents. It boosts project docs and production entrypoints while downranking generated/minified/build/test/dependency nodes.
 
@@ -154,7 +163,7 @@ Agents auto-check the graph before architecture questions and rebuild after code
 | Crate | Role |
 |-------|------|
 | `graphify-core` | Data models, graph structure, confidence system |
-| `graphify-extract` | AST extraction (21 languages), Claude API semantic extraction |
+| `graphify-extract` | AST extraction (21 languages), multi-provider LLM semantic extraction |
 | `graphify-cluster` | Leiden community detection, incremental re-clustering |
 | `graphify-analyze` | PageRank, cycles, embeddings, god nodes, temporal risk |
 | `graphify-embed` | Model2Vec semantic index build/query |
@@ -182,7 +191,7 @@ graphify-rs query "question" [--dfs] [--budget 2000]            # query
 graphify-rs watch --path .                                       # auto-rebuild
     graphify-rs serve                                                 # MCP stdio server
     graphify-rs serve --transport http --registry-path .graphify/.graphifyq-server.json
-    graphifyq query "where is auth wired?"                            # semantic by default; auto-refresh stale graph, reuse local HTTP sidecar
+    graphifyq query "where is auth wired?" --format toon               # semantic + compact agent rows; auto-refresh stale graph, reuse local HTTP sidecar
 graphify-rs diff old.json new.json                               # compare
 graphify-rs stats graph.json                                     # statistics
 ```

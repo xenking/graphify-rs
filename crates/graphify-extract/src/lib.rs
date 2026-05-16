@@ -25,10 +25,6 @@ use graphify_core::model::{ExtractionResult, GraphEdge, NodeType};
 use rayon::prelude::*;
 use tracing::{debug, info, warn};
 
-// ---------------------------------------------------------------------------
-// Extension → language dispatch table
-// ---------------------------------------------------------------------------
-
 /// Maps file extensions to language identifiers used by the extraction engine.
 pub const DISPATCH: &[(&str, &str)] = &[
     (".py", "python"),
@@ -65,27 +61,24 @@ pub const DISPATCH: &[(&str, &str)] = &[
     (".sql", "sql"),
 ];
 
-/// Build a hashmap for fast extension lookup.
-fn dispatch_map() -> HashMap<&'static str, &'static str> {
-    DISPATCH.iter().copied().collect()
+/// Build a hashmap for fast extension lookup (cached).
+fn dispatch_map() -> &'static HashMap<&'static str, &'static str> {
+    static MAP: std::sync::LazyLock<HashMap<&str, &str>> =
+        std::sync::LazyLock::new(|| DISPATCH.iter().copied().collect());
+    &MAP
 }
 
 /// Return the language name for a file extension (e.g. `".py"` → `"python"`).
 pub fn language_for_path(path: &Path) -> Option<&'static str> {
     let ext = path.extension()?.to_str()?;
-    let dotted = format!(".{ext}");
-    dispatch_map().get(dotted.as_str()).copied()
+    dispatch_map().get(&*format!(".{ext}")).copied()
 }
-
-// ---------------------------------------------------------------------------
-// File collection
-// ---------------------------------------------------------------------------
 
 /// Recursively collect all supported source files under `target`.
 pub fn collect_files(target: &Path) -> Vec<PathBuf> {
     let map = dispatch_map();
     let mut files = Vec::new();
-    collect_files_inner(target, &map, &mut files);
+    collect_files_inner(target, map, &mut files);
     files.sort();
     files
 }
@@ -101,7 +94,6 @@ fn collect_files_inner(dir: &Path, map: &HashMap<&str, &str>, out: &mut Vec<Path
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            // Skip hidden dirs and common vendor dirs
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name.starts_with('.')
                 || name == "node_modules"
@@ -123,10 +115,6 @@ fn collect_files_inner(dir: &Path, map: &HashMap<&str, &str>, out: &mut Vec<Path
     }
 }
 
-// ---------------------------------------------------------------------------
-// Main extraction entry point
-// ---------------------------------------------------------------------------
-
 /// Run Pass 1 extraction on a set of file paths.
 ///
 /// Dispatches each file to the appropriate regex-based extractor, collects all
@@ -138,12 +126,11 @@ pub fn extract(paths: &[PathBuf]) -> ExtractionResult {
     let results: Vec<ExtractionResult> = paths
         .par_iter()
         .filter_map(|path| {
-            let lang = match language_for_path(path) {
-                Some(l) => l,
-                None => {
-                    debug!("skipping unsupported file: {}", path.display());
-                    return None;
-                }
+            let lang = if let Some(l) = language_for_path(path) {
+                l
+            } else {
+                debug!("skipping unsupported file: {}", path.display());
+                return None;
             };
 
             let source = match std::fs::read(path) {
@@ -156,7 +143,6 @@ pub fn extract(paths: &[PathBuf]) -> ExtractionResult {
 
             debug!("extracting {} ({})", path.display(), lang);
 
-            // Try deterministic SQL/sqlparser first, then tree-sitter, then regex.
             #[cfg(feature = "sql")]
             let sql_result = if lang == "sql" {
                 let source_str = String::from_utf8_lossy(&source);
@@ -191,11 +177,7 @@ pub fn extract(paths: &[PathBuf]) -> ExtractionResult {
         combined.hyperedges.extend(r.hyperedges);
     }
 
-    // Cross-file import resolution for Python
-    resolve_python_imports(&mut combined);
-
-    // Cross-file import resolution for JS/TS, Go, and Rust
-    resolve_cross_file_imports(&mut combined);
+    resolve_import_relationships(&mut combined);
 
     info!(
         "extraction complete: {} nodes, {} edges",
@@ -206,19 +188,31 @@ pub fn extract(paths: &[PathBuf]) -> ExtractionResult {
     combined
 }
 
+/// Resolve import edges into cross-file relationship edges after multiple
+/// extraction results have been merged.
+///
+/// This is intentionally idempotent so callers can run it both after direct
+/// multi-file extraction and after cache-backed per-file extraction.
+pub fn resolve_import_relationships(result: &mut ExtractionResult) {
+    resolve_python_imports(result);
+    resolve_cross_file_imports(result);
+}
+
 /// Resolve Python `import` / `from ... import` edges to actual module/function
 /// nodes discovered across files.
 ///
 /// Also handles `from x import *` by expanding to all entities in module x.
 fn resolve_python_imports(result: &mut ExtractionResult) {
-    // Build a lookup from node label → node id
-    let label_to_id: HashMap<String, String> = result
-        .nodes
-        .iter()
-        .map(|n| (n.label.clone(), n.id.clone()))
-        .collect();
+    let label_to_ids: HashMap<String, Vec<(String, String)>> = {
+        let mut map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for n in &result.nodes {
+            map.entry(n.label.clone())
+                .or_default()
+                .push((n.id.clone(), n.source_file.clone()));
+        }
+        map
+    };
 
-    // Build module stem → [entity_id] for star import expansion
     let mut stem_to_entity_ids: HashMap<String, Vec<String>> = HashMap::new();
     let defined_targets: HashSet<String> = result
         .edges
@@ -241,25 +235,30 @@ fn resolve_python_imports(result: &mut ExtractionResult) {
             .push(node.id.clone());
     }
 
-    // Collect star import edges for expansion
     let mut star_expansions: Vec<GraphEdge> = Vec::new();
+    let mut seen_star_uses: HashSet<(String, String)> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.relation == "uses")
+        .map(|edge| (edge.source.clone(), edge.target.clone()))
+        .collect();
 
-    // For every edge with relation "imports", try to resolve the target
     for edge in &mut result.edges {
         if edge.relation == "imports" {
-            // Check for star import: target label contains "*"
             let import_label = result
                 .nodes
                 .iter()
                 .find(|n| n.id == edge.target)
-                .map(|n| n.label.as_str())
-                .unwrap_or("");
+                .map_or("", |n| n.label.as_str());
 
             if import_label.contains('*') {
                 // `from module import *` — expand to all entities in module
                 let module_name = import_label.trim_end_matches(".*").trim_end_matches(" *");
                 if let Some(entity_ids) = stem_to_entity_ids.get(module_name) {
                     for target_id in entity_ids {
+                        if !seen_star_uses.insert((edge.source.clone(), target_id.clone())) {
+                            continue;
+                        }
                         star_expansions.push(GraphEdge {
                             source: edge.source.clone(),
                             target: target_id.clone(),
@@ -273,10 +272,14 @@ fn resolve_python_imports(result: &mut ExtractionResult) {
                         });
                     }
                 }
-            } else {
-                // Regular import — resolve by label
-                if let Some(resolved_id) = label_to_id.get(&edge.target) {
-                    edge.target = resolved_id.clone();
+            } else if let Some(candidates) = label_to_ids.get(&edge.target) {
+                let resolved = candidates
+                    .iter()
+                    .find(|(_, sf)| sf == &edge.source_file)
+                    .or_else(|| candidates.first())
+                    .map(|(id, _)| id.clone());
+                if let Some(resolved_id) = resolved {
+                    edge.target = resolved_id;
                     edge.confidence = graphify_core::confidence::Confidence::Extracted;
                 }
             }
@@ -298,18 +301,15 @@ fn resolve_python_imports(result: &mut ExtractionResult) {
 /// stem and then creates `uses` edges from entities in the importing file to
 /// entities defined in the target module. This turns file-level import edges
 /// into entity-level relationship edges.
+const MAX_IMPORT_ENTITY_EDGE_EXPANSION: usize = 500;
+
 fn resolve_cross_file_imports(result: &mut ExtractionResult) {
-    // Step 1: Build lookup indexes in a single pass over nodes.
-    //   - id_to_label: node_id → label (for fast import label lookup)
-    //   - stem_to_entities: file_stem → [(label, node_id, node_type)]
-    //   - go_pkg_to_entities: go_dir_name → [(label, node_id, node_type)]
     let mut id_to_label: HashMap<String, String> = HashMap::new();
     let mut stem_to_entities: HashMap<String, Vec<(String, String, NodeType)>> = HashMap::new();
     let mut go_pkg_to_entities: HashMap<String, Vec<(String, String, NodeType)>> = HashMap::new();
     let mut source_file_to_stem: HashMap<String, String> = HashMap::new();
     let mut file_id_to_source: HashMap<String, String> = HashMap::new();
 
-    // Collect defined entity IDs from edges (one pass)
     let defined_entity_ids: HashSet<String> = result
         .edges
         .iter()
@@ -317,18 +317,18 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
         .map(|e| e.target.clone())
         .collect();
 
-    // Build source_file → [entity_node_id] and id_to_label in one pass over edges
     let mut source_file_entities: HashMap<String, Vec<String>> = HashMap::new();
+    let mut entity_to_file_id: HashMap<String, String> = HashMap::new();
     for edge in &result.edges {
         if edge.relation == "defines" {
             source_file_entities
                 .entry(edge.source_file.clone())
                 .or_default()
                 .push(edge.target.clone());
+            entity_to_file_id.insert(edge.target.clone(), edge.source.clone());
         }
     }
 
-    // Single pass over nodes to build all indexes
     for node in &result.nodes {
         id_to_label.insert(node.id.clone(), node.label.clone());
 
@@ -360,7 +360,6 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
             node.node_type.clone(),
         ));
 
-        // Go package grouping
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         if ext == "go"
             && let Some(dir) = path
@@ -375,9 +374,13 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
         }
     }
 
-    // Step 2: Resolve imports → create uses edges
     let mut new_edges: Vec<GraphEdge> = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<(String, String)> = result
+        .edges
+        .iter()
+        .filter(|edge| edge.relation == "uses")
+        .map(|edge| (edge.source.clone(), edge.target.clone()))
+        .collect();
 
     for edge in &result.edges {
         if edge.relation != "imports" {
@@ -390,7 +393,6 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
             .and_then(|e| e.to_str())
             .unwrap_or("");
 
-        // O(1) lookup instead of linear scan
         let import_label = match id_to_label.get(&edge.target) {
             Some(label) => label.as_str(),
             None => continue,
@@ -433,14 +435,85 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
             continue;
         }
 
-        // Get the importing file's own entities
         let local_entities = match source_file_entities.get(source_file) {
             Some(ids) => ids,
             None => continue,
         };
 
-        // Create uses edges: each entity in the importing file → each entity in the target module
+        // Create uses edges: each entity in the importing file → each entity in the target module.
+        // Very large imports are collapsed to file-level edges to avoid explosive graph growth.
+        if local_entities.len().saturating_mul(target_entities.len())
+            > MAX_IMPORT_ENTITY_EDGE_EXPANSION
+        {
+            for (_, target_id, _) in &target_entities {
+                let Some(target_file_id) = entity_to_file_id.get(target_id) else {
+                    continue;
+                };
+                if &edge.source == target_file_id {
+                    continue;
+                }
+                let key = (edge.source.clone(), target_file_id.clone());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.insert(key);
+                new_edges.push(GraphEdge {
+                    source: edge.source.clone(),
+                    target: target_file_id.clone(),
+                    relation: "uses".to_string(),
+                    confidence: Confidence::Inferred,
+                    confidence_score: 0.8,
+                    source_file: source_file.clone(),
+                    source_location: None,
+                    weight: 0.8,
+                    extra: Default::default(),
+                });
+            }
+            continue;
+        }
+
+        let target_by_label: HashMap<&str, &String> = target_entities
+            .iter()
+            .filter_map(|(lbl, id, _)| {
+                if !lbl.is_empty() {
+                    Some((lbl.as_str(), id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         for local_id in local_entities {
+            let local_label = match id_to_label.get(local_id) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            if let Some(&target_id) = target_by_label.get(local_label.as_str()) {
+                if local_id == target_id {
+                    continue;
+                }
+                let key = (local_id.clone(), target_id.clone());
+                if seen.contains(&key) {
+                    continue;
+                }
+                seen.insert(key);
+                new_edges.push(GraphEdge {
+                    source: local_id.clone(),
+                    target: target_id.clone(),
+                    relation: "uses".to_string(),
+                    confidence: Confidence::Inferred,
+                    confidence_score: 0.8,
+                    source_file: source_file.clone(),
+                    source_location: None,
+                    weight: 0.8,
+                    extra: Default::default(),
+                });
+                continue;
+            }
+
+            const MAX_FALLBACK_EDGES: usize = 50;
+            let mut fallback_count = 0;
             for (_, target_id, _) in &target_entities {
                 if local_id == target_id {
                     continue;
@@ -461,6 +534,10 @@ fn resolve_cross_file_imports(result: &mut ExtractionResult) {
                     weight: 0.8,
                     extra: Default::default(),
                 });
+                fallback_count += 1;
+                if fallback_count >= MAX_FALLBACK_EDGES {
+                    break;
+                }
             }
         }
     }
@@ -488,12 +565,10 @@ fn resolve_jsts_import<'a>(
     import_label: &str,
     stem_to_entities: &'a HashMap<String, Vec<(String, String, NodeType)>>,
 ) -> Vec<&'a (String, String, NodeType)> {
-    // Strip alias: "Foo as Bar" → "Foo"
     let label = import_label.split(" as ").next().unwrap_or(import_label);
 
     let parts: Vec<&str> = label.split('/').collect();
 
-    // Try the first segment as module stem (for "module/Name" patterns)
     if parts.len() >= 2 {
         let module_stem = parts[0].trim_start_matches('.');
         if let Some(entities) = stem_to_entities.get(module_stem) {
@@ -501,7 +576,6 @@ fn resolve_jsts_import<'a>(
         }
     }
 
-    // Try the last segment as file stem (for path-style imports)
     if let Some(last) = parts.last() {
         let stem = last.trim_start_matches('.');
         if let Some(entities) = stem_to_entities.get(stem) {
@@ -509,13 +583,11 @@ fn resolve_jsts_import<'a>(
         }
     }
 
-    // Try the whole label as a stem (for simple imports like "React")
     let simple = label.trim_start_matches("./").trim_start_matches("../");
     if let Some(entities) = stem_to_entities.get(simple) {
         return entities.iter().collect();
     }
 
-    // Barrel export: if the last segment matches a directory, check for "index" file
     if let Some(entities) = stem_to_entities.get("index")
         && (label.contains('/') || label.starts_with('.'))
     {
@@ -535,11 +607,9 @@ fn resolve_go_import<'a>(
     stem_to_entities: &'a HashMap<String, Vec<(String, String, NodeType)>>,
     go_pkg_to_entities: &'a HashMap<String, Vec<(String, String, NodeType)>>,
 ) -> Vec<&'a (String, String, NodeType)> {
-    // Strip dot import prefix, blank import prefix, or alias
     let label = import_label
         .trim_start_matches(". ")
         .trim_start_matches("_ ");
-    // Also strip any remaining alias: `alias "path"` → `"path"`
     let label = if label.contains('"') {
         label.split('"').nth(1).unwrap_or(label)
     } else {
@@ -572,7 +642,6 @@ fn resolve_rust_import<'a>(
         .unwrap_or(import_label);
     let segments: Vec<&str> = label.split("::").collect();
 
-    // Glob import: `use module::*` → return all entities from module
     if segments.last() == Some(&"*") && segments.len() >= 2 {
         let module = segments[segments.len() - 2];
         if let Some(entities) = stem_to_entities.get(module) {
@@ -580,7 +649,6 @@ fn resolve_rust_import<'a>(
         }
     }
 
-    // Try the last segment as a module/file stem
     if let Some(last) = segments.last()
         && *last != "*"
         && let Some(entities) = stem_to_entities.get(*last)
@@ -588,7 +656,6 @@ fn resolve_rust_import<'a>(
         return entities.iter().collect();
     }
 
-    // Try the second-to-last segment (for `crate::module::Type` patterns)
     if segments.len() >= 2 {
         let module = segments[segments.len() - 2];
         if let Some(entities) = stem_to_entities.get(module) {
@@ -612,7 +679,6 @@ fn resolve_dot_import<'a>(
     import_label: &str,
     stem_to_entities: &'a HashMap<String, Vec<(String, String, NodeType)>>,
 ) -> Vec<&'a (String, String, NodeType)> {
-    // Strip common prefixes: "static ", alias part after " = "
     let label = import_label.strip_prefix("static ").unwrap_or(import_label);
     let label = if let Some(idx) = label.find(" = ") {
         label[idx + 3..].trim()
@@ -622,14 +688,12 @@ fn resolve_dot_import<'a>(
 
     let segments: Vec<&str> = label.split('.').collect();
 
-    // Try the last segment as a type/entity name matching a file stem
     if let Some(last) = segments.last()
         && let Some(entities) = stem_to_entities.get(*last)
     {
         return entities.iter().collect();
     }
 
-    // Try second-to-last as module, filter to last segment
     if segments.len() >= 2 {
         let module = segments[segments.len() - 2];
         if let Some(entities) = stem_to_entities.get(module) {
@@ -653,14 +717,12 @@ fn resolve_c_include<'a>(
     import_label: &str,
     stem_to_entities: &'a HashMap<String, Vec<(String, String, NodeType)>>,
 ) -> Vec<&'a (String, String, NodeType)> {
-    // Strip angle brackets and quotes
     let label = import_label
         .trim_start_matches('<')
         .trim_end_matches('>')
         .trim_start_matches('"')
         .trim_end_matches('"');
 
-    // Strip extension (.h, .hpp, etc.)
     let stem = std::path::Path::new(label)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -682,14 +744,12 @@ fn resolve_backslash_import<'a>(
 ) -> Vec<&'a (String, String, NodeType)> {
     let segments: Vec<&str> = import_label.split('\\').collect();
 
-    // Try the last segment as entity name
     if let Some(last) = segments.last()
         && let Some(entities) = stem_to_entities.get(*last)
     {
         return entities.iter().collect();
     }
 
-    // Try second-to-last as module
     if segments.len() >= 2 {
         let module = segments[segments.len() - 2];
         if let Some(entities) = stem_to_entities.get(module) {
@@ -708,10 +768,8 @@ fn resolve_dart_import<'a>(
     import_label: &str,
     stem_to_entities: &'a HashMap<String, Vec<(String, String, NodeType)>>,
 ) -> Vec<&'a (String, String, NodeType)> {
-    // Start with the full import label
     let mut label = import_label;
 
-    // Strip common prefixes: "import ", "export ", "part "
     if let Some(stripped) = label.strip_prefix("import ") {
         label = stripped;
     } else if let Some(stripped) = label.strip_prefix("export ") {
@@ -720,8 +778,6 @@ fn resolve_dart_import<'a>(
         label = stripped;
     }
 
-    // Step 1: Handle aliased imports like "utils.dart' as utils"
-    // Extract the path part before " as "
     let path_and_alias = label;
     let path_part = if let Some(idx) = path_and_alias.find(" as ") {
         &path_and_alias[..idx]
@@ -729,8 +785,6 @@ fn resolve_dart_import<'a>(
         path_and_alias
     };
 
-    // Step 2: Handle deferred imports like "heavy.dart' deferred as heavy"
-    // Extract the path part before " deferred"
     let path_deferred = path_part;
     let path_no_deferred = if let Some(idx) = path_deferred.find(" deferred") {
         &path_deferred[..idx]
@@ -738,30 +792,22 @@ fn resolve_dart_import<'a>(
         path_deferred
     };
 
-    // Step 3: Strip quotes
     let quoted = path_no_deferred.trim();
     let unquoted = quoted
         .trim_matches('\'') // Single quote character
         .trim_matches('"');
 
-    // Step 4: Handle relative imports with "../" - resolve up to file stem
     let normalized = if unquoted.contains("../") {
-        // For relative imports, just take the last segment (filename)
-        // e.g., "../models/user.dart" -> "user"
         let last_segment = unquoted.rsplit('/').next().unwrap_or(unquoted);
         last_segment.strip_suffix(".dart").unwrap_or(last_segment)
     } else {
-        // Step 5: Strip "package:" prefix
         let path_part = unquoted.strip_prefix("package:").unwrap_or(unquoted);
 
-        // Step 6: Extract last path segment (filename)
         let last_segment = path_part.rsplit('/').next().unwrap_or(path_part);
 
-        // Step 7: Strip .dart extension
         last_segment.strip_suffix(".dart").unwrap_or(last_segment)
     };
 
-    // Look up the stem in the entities map
     if let Some(entities) = stem_to_entities.get(normalized) {
         return entities.iter().collect();
     }
@@ -769,942 +815,5 @@ fn resolve_dart_import<'a>(
     Vec::new()
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use graphify_core::model::{GraphEdge, GraphNode};
-
-    #[test]
-    fn dispatch_table_covers_all_languages() {
-        let map = dispatch_map();
-        assert_eq!(map.get(".py"), Some(&"python"));
-        assert_eq!(map.get(".rs"), Some(&"rust"));
-        assert_eq!(map.get(".go"), Some(&"go"));
-        assert_eq!(map.get(".tsx"), Some(&"typescript"));
-        assert_eq!(map.get(".jl"), Some(&"julia"));
-        assert_eq!(map.get(".mm"), Some(&"objc"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers for cross-file import resolution tests
-    // -----------------------------------------------------------------------
-
-    fn make_test_node(id: &str, label: &str, source_file: &str, node_type: NodeType) -> GraphNode {
-        GraphNode {
-            id: id.to_string(),
-            label: label.to_string(),
-            source_file: source_file.to_string(),
-            source_location: None,
-            node_type,
-            community: None,
-            extra: Default::default(),
-        }
-    }
-
-    fn make_test_edge(source: &str, target: &str, relation: &str, source_file: &str) -> GraphEdge {
-        GraphEdge {
-            source: source.to_string(),
-            target: target.to_string(),
-            relation: relation.to_string(),
-            confidence: Confidence::Extracted,
-            confidence_score: 1.0,
-            source_file: source_file.to_string(),
-            source_location: None,
-            weight: 1.0,
-            extra: Default::default(),
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // JS/TS cross-file resolution
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn jsts_cross_file_creates_uses_edges() {
-        // File: src/app.ts defines AppController, imports from "utils"
-        // File: src/utils.ts defines parseDate, formatDate
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_app", "app", "src/app.ts", NodeType::File),
-                make_test_node("app_ctrl", "AppController", "src/app.ts", NodeType::Class),
-                make_test_node(
-                    "import_utils",
-                    "utils/parseDate",
-                    "src/app.ts",
-                    NodeType::Module,
-                ),
-                make_test_node("file_utils", "utils", "src/utils.ts", NodeType::File),
-                make_test_node(
-                    "parse_date",
-                    "parseDate",
-                    "src/utils.ts",
-                    NodeType::Function,
-                ),
-                make_test_node(
-                    "format_date",
-                    "formatDate",
-                    "src/utils.ts",
-                    NodeType::Function,
-                ),
-            ],
-            edges: vec![
-                make_test_edge("file_app", "app_ctrl", "defines", "src/app.ts"),
-                make_test_edge("file_app", "import_utils", "imports", "src/app.ts"),
-                make_test_edge("file_utils", "parse_date", "defines", "src/utils.ts"),
-                make_test_edge("file_utils", "format_date", "defines", "src/utils.ts"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-
-        // AppController should use both parseDate and formatDate
-        assert_eq!(
-            uses_edges.len(),
-            2,
-            "expected 2 uses edges, got {}",
-            uses_edges.len()
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "app_ctrl" && e.target == "parse_date")
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "app_ctrl" && e.target == "format_date")
-        );
-
-        // All uses edges should be Inferred with weight 0.8
-        for edge in &uses_edges {
-            assert_eq!(edge.confidence, Confidence::Inferred);
-            assert!((edge.weight - 0.8).abs() < f64::EPSILON);
-            assert!((edge.confidence_score - 0.8).abs() < f64::EPSILON);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Go cross-file resolution
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn go_cross_file_creates_uses_edges() {
-        // File: cmd/main.go defines Server, imports "myproject/pkg/utils"
-        // File: pkg/utils/helpers.go defines ParseConfig, Validate
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_main", "main", "cmd/main.go", NodeType::File),
-                make_test_node("server", "Server", "cmd/main.go", NodeType::Struct),
-                make_test_node(
-                    "import_utils",
-                    "myproject/pkg/utils",
-                    "cmd/main.go",
-                    NodeType::Package,
-                ),
-                make_test_node(
-                    "file_helpers",
-                    "helpers",
-                    "pkg/utils/helpers.go",
-                    NodeType::File,
-                ),
-                make_test_node(
-                    "parse_config",
-                    "ParseConfig",
-                    "pkg/utils/helpers.go",
-                    NodeType::Function,
-                ),
-                make_test_node(
-                    "validate",
-                    "Validate",
-                    "pkg/utils/helpers.go",
-                    NodeType::Function,
-                ),
-            ],
-            edges: vec![
-                make_test_edge("file_main", "server", "defines", "cmd/main.go"),
-                make_test_edge("file_main", "import_utils", "imports", "cmd/main.go"),
-                make_test_edge(
-                    "file_helpers",
-                    "parse_config",
-                    "defines",
-                    "pkg/utils/helpers.go",
-                ),
-                make_test_edge(
-                    "file_helpers",
-                    "validate",
-                    "defines",
-                    "pkg/utils/helpers.go",
-                ),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-
-        // Server should use both ParseConfig and Validate
-        assert_eq!(
-            uses_edges.len(),
-            2,
-            "expected 2 uses edges, got {}",
-            uses_edges.len()
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "server" && e.target == "parse_config")
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "server" && e.target == "validate")
-        );
-
-        for edge in &uses_edges {
-            assert_eq!(edge.confidence, Confidence::Inferred);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Rust cross-file resolution
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn rust_cross_file_creates_uses_edges() {
-        // File: src/main.rs defines App, imports "crate::model"
-        // File: src/model.rs defines Config, Database
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_main", "main", "src/main.rs", NodeType::File),
-                make_test_node("app", "App", "src/main.rs", NodeType::Struct),
-                make_test_node(
-                    "import_model",
-                    "crate::model",
-                    "src/main.rs",
-                    NodeType::Module,
-                ),
-                make_test_node("file_model", "model", "src/model.rs", NodeType::File),
-                make_test_node("config", "Config", "src/model.rs", NodeType::Struct),
-                make_test_node("database", "Database", "src/model.rs", NodeType::Struct),
-            ],
-            edges: vec![
-                make_test_edge("file_main", "app", "defines", "src/main.rs"),
-                make_test_edge("file_main", "import_model", "imports", "src/main.rs"),
-                make_test_edge("file_model", "config", "defines", "src/model.rs"),
-                make_test_edge("file_model", "database", "defines", "src/model.rs"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-
-        // App should use both Config and Database
-        assert_eq!(
-            uses_edges.len(),
-            2,
-            "expected 2 uses edges, got {}",
-            uses_edges.len()
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "app" && e.target == "config")
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "app" && e.target == "database")
-        );
-
-        for edge in &uses_edges {
-            assert_eq!(edge.confidence, Confidence::Inferred);
-            assert!((edge.weight - 0.8).abs() < f64::EPSILON);
-        }
-    }
-
-    #[test]
-    fn rust_cross_file_resolves_specific_type() {
-        // `use crate::model::Config` should prefer Config over all entities in model
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_main", "main", "src/main.rs", NodeType::File),
-                make_test_node("app", "App", "src/main.rs", NodeType::Struct),
-                make_test_node(
-                    "import_config",
-                    "crate::model::Config",
-                    "src/main.rs",
-                    NodeType::Module,
-                ),
-                make_test_node("file_model", "model", "src/model.rs", NodeType::File),
-                make_test_node("config", "Config", "src/model.rs", NodeType::Struct),
-                make_test_node("database", "Database", "src/model.rs", NodeType::Struct),
-            ],
-            edges: vec![
-                make_test_edge("file_main", "app", "defines", "src/main.rs"),
-                make_test_edge("file_main", "import_config", "imports", "src/main.rs"),
-                make_test_edge("file_model", "config", "defines", "src/model.rs"),
-                make_test_edge("file_model", "database", "defines", "src/model.rs"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-
-        // Should only create edge to Config, not Database
-        assert_eq!(
-            uses_edges.len(),
-            1,
-            "expected 1 uses edge, got {}",
-            uses_edges.len()
-        );
-        assert_eq!(uses_edges[0].source, "app");
-        assert_eq!(uses_edges[0].target, "config");
-    }
-
-    #[test]
-    fn cross_file_no_duplicate_edges() {
-        // Two imports from the same module shouldn't create duplicate uses edges
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_app", "app", "src/app.ts", NodeType::File),
-                make_test_node("ctrl", "Controller", "src/app.ts", NodeType::Class),
-                make_test_node("import1", "utils/foo", "src/app.ts", NodeType::Module),
-                make_test_node("import2", "utils/bar", "src/app.ts", NodeType::Module),
-                make_test_node("file_utils", "utils", "src/utils.ts", NodeType::File),
-                make_test_node("helper", "Helper", "src/utils.ts", NodeType::Class),
-            ],
-            edges: vec![
-                make_test_edge("file_app", "ctrl", "defines", "src/app.ts"),
-                make_test_edge("file_app", "import1", "imports", "src/app.ts"),
-                make_test_edge("file_app", "import2", "imports", "src/app.ts"),
-                make_test_edge("file_utils", "helper", "defines", "src/utils.ts"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-
-        // Only one edge Controller → Helper even though there are two imports from utils
-        assert_eq!(
-            uses_edges.len(),
-            1,
-            "expected 1 uses edge (no dups), got {}",
-            uses_edges.len()
-        );
-    }
-
-    #[test]
-    fn cross_file_unresolved_import_creates_no_edges() {
-        // Import from external module (not in our files) should create no uses edges
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_main", "main", "src/main.rs", NodeType::File),
-                make_test_node("app", "App", "src/main.rs", NodeType::Struct),
-                make_test_node(
-                    "import_serde",
-                    "serde::Deserialize",
-                    "src/main.rs",
-                    NodeType::Module,
-                ),
-            ],
-            edges: vec![
-                make_test_edge("file_main", "app", "defines", "src/main.rs"),
-                make_test_edge("file_main", "import_serde", "imports", "src/main.rs"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-
-        assert!(
-            uses_edges.is_empty(),
-            "external imports should not create uses edges"
-        );
-    }
-
-    #[test]
-    fn python_resolver_not_broken_by_cross_file() {
-        // Ensure the Python resolver still works independently
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_a", "module_a", "src/a.py", NodeType::File),
-                make_test_node("my_class", "MyClass", "src/a.py", NodeType::Class),
-            ],
-            edges: vec![make_test_edge("file_a", "MyClass", "imports", "src/a.py")],
-            hyperedges: vec![],
-        };
-
-        resolve_python_imports(&mut result);
-
-        // The import edge target should resolve to the node ID "my_class"
-        assert_eq!(result.edges[0].target, "my_class");
-    }
-
-    // ===== Java cross-file resolution =====
-
-    #[test]
-    fn java_cross_file_creates_uses_edges() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_app", "App", "src/App.java", NodeType::File),
-                make_test_node("app_class", "App", "src/App.java", NodeType::Class),
-                make_test_node(
-                    "import_util",
-                    "com.example.Util",
-                    "src/App.java",
-                    NodeType::Module,
-                ),
-                make_test_node("file_util", "Util", "src/Util.java", NodeType::File),
-                make_test_node("util_class", "Util", "src/Util.java", NodeType::Class),
-            ],
-            edges: vec![
-                make_test_edge("file_app", "app_class", "defines", "src/App.java"),
-                make_test_edge("file_app", "import_util", "imports", "src/App.java"),
-                make_test_edge("file_util", "util_class", "defines", "src/Util.java"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert!(
-            !uses_edges.is_empty(),
-            "Java cross-file should create uses edges"
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "app_class" && e.target == "util_class")
-        );
-    }
-
-    // ===== C/C++ cross-file resolution =====
-
-    #[test]
-    fn c_include_creates_uses_edges() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_main", "main", "src/main.c", NodeType::File),
-                make_test_node("main_fn", "main", "src/main.c", NodeType::Function),
-                make_test_node("import_utils", "utils.h", "src/main.c", NodeType::Module),
-                make_test_node("file_utils", "utils", "src/utils.c", NodeType::File),
-                make_test_node("helper_fn", "helper", "src/utils.c", NodeType::Function),
-            ],
-            edges: vec![
-                make_test_edge("file_main", "main_fn", "defines", "src/main.c"),
-                make_test_edge("file_main", "import_utils", "imports", "src/main.c"),
-                make_test_edge("file_utils", "helper_fn", "defines", "src/utils.c"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert!(!uses_edges.is_empty(), "C include should create uses edges");
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "main_fn" && e.target == "helper_fn")
-        );
-    }
-
-    // ===== C# cross-file resolution =====
-
-    #[test]
-    fn csharp_using_creates_uses_edges() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_prog", "Program", "src/Program.cs", NodeType::File),
-                make_test_node("prog_class", "Program", "src/Program.cs", NodeType::Class),
-                make_test_node(
-                    "import_svc",
-                    "MyApp.Services.UserService",
-                    "src/Program.cs",
-                    NodeType::Module,
-                ),
-                make_test_node(
-                    "file_svc",
-                    "UserService",
-                    "src/UserService.cs",
-                    NodeType::File,
-                ),
-                make_test_node(
-                    "svc_class",
-                    "UserService",
-                    "src/UserService.cs",
-                    NodeType::Class,
-                ),
-            ],
-            edges: vec![
-                make_test_edge("file_prog", "prog_class", "defines", "src/Program.cs"),
-                make_test_edge("file_prog", "import_svc", "imports", "src/Program.cs"),
-                make_test_edge("file_svc", "svc_class", "defines", "src/UserService.cs"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert!(!uses_edges.is_empty(), "C# using should create uses edges");
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "prog_class" && e.target == "svc_class")
-        );
-    }
-
-    // ===== PHP cross-file resolution =====
-
-    #[test]
-    fn php_use_creates_uses_edges() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node(
-                    "file_ctrl",
-                    "Controller",
-                    "src/Controller.php",
-                    NodeType::File,
-                ),
-                make_test_node(
-                    "ctrl_class",
-                    "Controller",
-                    "src/Controller.php",
-                    NodeType::Class,
-                ),
-                make_test_node(
-                    "import_user",
-                    r"use App\Models\User",
-                    "src/Controller.php",
-                    NodeType::Module,
-                ),
-                make_test_node("file_user", "User", "src/User.php", NodeType::File),
-                make_test_node("user_class", "User", "src/User.php", NodeType::Class),
-            ],
-            edges: vec![
-                make_test_edge("file_ctrl", "ctrl_class", "defines", "src/Controller.php"),
-                make_test_edge("file_ctrl", "import_user", "imports", "src/Controller.php"),
-                make_test_edge("file_user", "user_class", "defines", "src/User.php"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert!(!uses_edges.is_empty(), "PHP use should create uses edges");
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "ctrl_class" && e.target == "user_class")
-        );
-    }
-
-    // ===== Dart cross-file resolution =====
-
-    #[test]
-    fn dart_import_creates_uses_edges() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_main", "main", "lib/main.dart", NodeType::File),
-                make_test_node("main_fn", "main", "lib/main.dart", NodeType::Function),
-                make_test_node(
-                    "import_utils",
-                    "import 'package:myapp/utils.dart'",
-                    "lib/main.dart",
-                    NodeType::Module,
-                ),
-                make_test_node("file_utils", "utils", "lib/utils.dart", NodeType::File),
-                make_test_node("helper_fn", "helper", "lib/utils.dart", NodeType::Function),
-            ],
-            edges: vec![
-                make_test_edge("file_main", "main_fn", "defines", "lib/main.dart"),
-                make_test_edge("file_main", "import_utils", "imports", "lib/main.dart"),
-                make_test_edge("file_utils", "helper_fn", "defines", "lib/utils.dart"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert!(
-            !uses_edges.is_empty(),
-            "Dart import should create uses edges"
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "main_fn" && e.target == "helper_fn")
-        );
-    }
-
-    // ===== Kotlin cross-file resolution =====
-
-    #[test]
-    fn kotlin_import_creates_uses_edges() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_main", "Main", "src/Main.kt", NodeType::File),
-                make_test_node("main_fn", "main", "src/Main.kt", NodeType::Function),
-                make_test_node(
-                    "import_repo",
-                    "import com.example.UserRepo",
-                    "src/Main.kt",
-                    NodeType::Module,
-                ),
-                make_test_node("file_repo", "UserRepo", "src/UserRepo.kt", NodeType::File),
-                make_test_node("repo_class", "UserRepo", "src/UserRepo.kt", NodeType::Class),
-            ],
-            edges: vec![
-                make_test_edge("file_main", "main_fn", "defines", "src/Main.kt"),
-                make_test_edge("file_main", "import_repo", "imports", "src/Main.kt"),
-                make_test_edge("file_repo", "repo_class", "defines", "src/UserRepo.kt"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert!(
-            !uses_edges.is_empty(),
-            "Kotlin import should create uses edges"
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "main_fn" && e.target == "repo_class")
-        );
-    }
-
-    // ===== Python star import expansion =====
-
-    #[test]
-    fn python_star_import_expands_to_entities() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_app", "app", "src/app.py", NodeType::File),
-                make_test_node("app_fn", "run", "src/app.py", NodeType::Function),
-                make_test_node("import_star", "utils.*", "src/app.py", NodeType::Module),
-                make_test_node("file_utils", "utils", "src/utils.py", NodeType::File),
-                make_test_node("helper1", "helper1", "src/utils.py", NodeType::Function),
-                make_test_node("helper2", "helper2", "src/utils.py", NodeType::Function),
-            ],
-            edges: vec![
-                make_test_edge("file_app", "app_fn", "defines", "src/app.py"),
-                make_test_edge("file_app", "import_star", "imports", "src/app.py"),
-                make_test_edge("file_utils", "helper1", "defines", "src/utils.py"),
-                make_test_edge("file_utils", "helper2", "defines", "src/utils.py"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_python_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert_eq!(
-            uses_edges.len(),
-            2,
-            "star import should expand to 2 uses edges, got {}",
-            uses_edges.len()
-        );
-    }
-
-    // ===== Scala cross-file resolution =====
-
-    #[test]
-    fn scala_cross_file_creates_uses_edges() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_main", "Main", "src/Main.scala", NodeType::File),
-                make_test_node("main_fn", "main", "src/Main.scala", NodeType::Function),
-                make_test_node(
-                    "import_calc",
-                    "import com.example.Calculator",
-                    "src/Main.scala",
-                    NodeType::Module,
-                ),
-                make_test_node(
-                    "file_calc",
-                    "Calculator",
-                    "src/Calculator.scala",
-                    NodeType::File,
-                ),
-                make_test_node(
-                    "calc_class",
-                    "Calculator",
-                    "src/Calculator.scala",
-                    NodeType::Class,
-                ),
-            ],
-            edges: vec![
-                make_test_edge("file_main", "main_fn", "defines", "src/Main.scala"),
-                make_test_edge("file_main", "import_calc", "imports", "src/Main.scala"),
-                make_test_edge("file_calc", "calc_class", "defines", "src/Calculator.scala"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert!(
-            !uses_edges.is_empty(),
-            "Scala cross-file should create uses edges"
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "main_fn" && e.target == "calc_class")
-        );
-    }
-
-    // ===== Swift cross-file resolution =====
-
-    #[test]
-    fn swift_cross_file_creates_uses_edges() {
-        let mut result = ExtractionResult {
-            nodes: vec![
-                make_test_node("file_app", "App", "src/App.swift", NodeType::File),
-                make_test_node("app_fn", "run", "src/App.swift", NodeType::Function),
-                make_test_node(
-                    "import_mgr",
-                    "import UserManager",
-                    "src/App.swift",
-                    NodeType::Module,
-                ),
-                make_test_node(
-                    "file_mgr",
-                    "UserManager",
-                    "src/UserManager.swift",
-                    NodeType::File,
-                ),
-                make_test_node(
-                    "mgr_class",
-                    "UserManager",
-                    "src/UserManager.swift",
-                    NodeType::Class,
-                ),
-            ],
-            edges: vec![
-                make_test_edge("file_app", "app_fn", "defines", "src/App.swift"),
-                make_test_edge("file_app", "import_mgr", "imports", "src/App.swift"),
-                make_test_edge("file_mgr", "mgr_class", "defines", "src/UserManager.swift"),
-            ],
-            hyperedges: vec![],
-        };
-
-        resolve_cross_file_imports(&mut result);
-
-        let uses_edges: Vec<_> = result
-            .edges
-            .iter()
-            .filter(|e| e.relation == "uses")
-            .collect();
-        assert!(
-            !uses_edges.is_empty(),
-            "Swift cross-file should create uses edges"
-        );
-        assert!(
-            uses_edges
-                .iter()
-                .any(|e| e.source == "app_fn" && e.target == "mgr_class")
-        );
-    }
-
-    // ===== Resolver unit tests =====
-
-    #[test]
-    fn jsts_resolver_strips_alias() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "utils".to_string(),
-            vec![("parseDate".into(), "pd_id".into(), NodeType::Function)],
-        );
-        // "utils/parseDate as pd" should still resolve to utils entities
-        let result = resolve_jsts_import("utils/parseDate as pd", &entities);
-        assert!(!result.is_empty(), "aliased JS import should resolve");
-    }
-
-    #[test]
-    fn go_resolver_handles_blank_import() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "driver".to_string(),
-            vec![("Register".into(), "reg_id".into(), NodeType::Function)],
-        );
-        let empty = HashMap::new();
-        // import _ "database/sql/driver"
-        let result = resolve_go_import("_ database/sql/driver", &entities, &empty);
-        assert!(!result.is_empty(), "Go blank import should resolve");
-    }
-
-    #[test]
-    fn go_resolver_handles_alias_import() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "http".to_string(),
-            vec![("Server".into(), "srv_id".into(), NodeType::Struct)],
-        );
-        let empty = HashMap::new();
-        // import h "net/http"
-        let result = resolve_go_import(r#"h "net/http""#, &entities, &empty);
-        assert!(!result.is_empty(), "Go aliased import should resolve");
-    }
-
-    #[test]
-    fn rust_resolver_handles_glob() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "model".to_string(),
-            vec![
-                ("Config".into(), "cfg_id".into(), NodeType::Struct),
-                ("Database".into(), "db_id".into(), NodeType::Struct),
-            ],
-        );
-        // use crate::model::*
-        let result = resolve_rust_import("crate::model::*", &entities);
-        assert_eq!(result.len(), 2, "glob import should return all entities");
-    }
-
-    #[test]
-    fn dot_resolver_handles_static_import() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "Math".to_string(),
-            vec![("sqrt".into(), "sqrt_id".into(), NodeType::Function)],
-        );
-        // import static java.lang.Math.sqrt
-        let result = resolve_dot_import("static java.lang.Math.sqrt", &entities);
-        assert!(
-            !result.is_empty(),
-            "Java static import should resolve: got empty"
-        );
-    }
-
-    #[test]
-    fn dot_resolver_handles_csharp_alias() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "MySqlClient".to_string(),
-            vec![("Connection".into(), "conn_id".into(), NodeType::Class)],
-        );
-        // using MySql = MySql.Data.MySqlClient
-        let result = resolve_dot_import("MySql = MySql.Data.MySqlClient", &entities);
-        assert!(
-            !result.is_empty(),
-            "C# alias using should resolve: got empty"
-        );
-    }
-
-    #[test]
-    fn dart_resolver_handles_relative_import() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "user".to_string(),
-            vec![("User".into(), "user_id".into(), NodeType::Class)],
-        );
-        let result = resolve_dart_import("import '../models/user.dart'", &entities);
-        assert!(!result.is_empty(), "Dart relative import should resolve");
-    }
-
-    #[test]
-    fn dart_resolver_handles_deferred_import() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "heavy".to_string(),
-            vec![("compute".into(), "comp_id".into(), NodeType::Function)],
-        );
-        let result = resolve_dart_import(
-            "import 'package:myapp/heavy.dart' deferred as heavy",
-            &entities,
-        );
-        assert!(!result.is_empty(), "Dart deferred import should resolve");
-    }
-
-    #[test]
-    fn dart_resolver_handles_part_directive() {
-        let mut entities = HashMap::new();
-        entities.insert(
-            "models".to_string(),
-            vec![("Item".into(), "item_id".into(), NodeType::Class)],
-        );
-        let result = resolve_dart_import("part 'src/models.dart'", &entities);
-        assert!(!result.is_empty(), "Dart part directive should resolve");
-    }
-}
+mod tests;

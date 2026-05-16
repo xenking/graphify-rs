@@ -80,13 +80,15 @@ LLM cache rules:
 Prefer `graphifyq`; it behaves like `fffq`: it starts or reuses a per-project
 local HTTP MCP sidecar, auto-refreshes stale graphs, writes its registry to
 `.graphify/.graphifyq-server.json`, prints the answer, and exits.
+Its sidecars exit after 900 idle seconds. Use `graphifyq gc --dry-run` /
+`graphifyq gc` to inspect or stop stale/orphan sidecars.
 
 ```bash
 graphifyq ensure
-graphifyq query "where is authentication wired?"
-graphifyq summary architecture --budget 3000
-graphifyq stats
-graphifyq tool graph_stats '{}'
+graphifyq query "where is authentication wired?" --format toon
+graphifyq summary architecture --budget 3000 --format toon
+graphifyq stats --format toon
+graphifyq tool graph_stats '{}' --format toon
 ```
 
 Use graphify for architecture/codebase questions after FFF/grepai source lookup,
@@ -111,6 +113,7 @@ Codex hook output; use `graphifyq` explicitly for graph context.
 
 - If `.graphify/GRAPH_REPORT.md` exists, consult it before broad architecture answers.
 - Prefer `graphifyq query` or `graphifyq summary architecture` for concise context.
+- Default `graphifyq query`, `summary`, `stats`, and `tool` to `--format toon` for agent context; omit it only when the user asks for prose/human-readable text.
 - Keep `.graphify/` current after meaningful code edits with `graphifyq ensure`; use `--no-llm --update` only to force an immediate rebuild without new LLM calls.
 - Use `graphifyq ensure --with-llm --llm-command "graphify-llm-codex ..."` only for explicit LLM refresh/enrichment.
 - Do not paste entire reports; summarize god nodes, communities, cycles, and next questions.

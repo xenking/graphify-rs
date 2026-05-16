@@ -33,7 +33,6 @@ pub fn export_html(
     let total_nodes = graph.node_count();
     let total_edges = graph.edge_count();
 
-    // Determine which nodes to include
     let (included_nodes, pruned) = if total_nodes > max_vis {
         warn!(
             total_nodes,
@@ -49,15 +48,7 @@ pub fn export_html(
         )
     };
 
-    // Build reverse lookup: node_id → community_id
-    let mut node_community: HashMap<&str, usize> = HashMap::new();
-    for (&cid, members) in communities {
-        for nid in members {
-            node_community.insert(nid.as_str(), cid);
-        }
-    }
-
-    // Build vis.js nodes JSON array
+    let node_community = graphify_core::build_node_to_community(communities);
     let mut vis_nodes = String::from("[");
     let mut first = true;
     for node in graph.nodes() {
@@ -71,15 +62,12 @@ pub fn export_html(
         let cid = node
             .community
             .or_else(|| node_community.get(node.id.as_str()).copied());
-        let color = cid
-            .map(|c| COMMUNITY_COLORS[c % COMMUNITY_COLORS.len()])
-            .unwrap_or("#888888");
+        let color = cid.map_or("#888888", |c| COMMUNITY_COLORS[c % COMMUNITY_COLORS.len()]);
         let degree = graph.degree(&node.id);
-        // Scale node size by degree
         let size = 8.0 + (degree as f64).sqrt() * 4.0;
         let label_escaped = escape_js(&node.label);
         let title_escaped = escape_js(&format!(
-            "{} ({})\nFile: {}\nType: {:?}\nDegree: {}",
+            "{} ({})\nFile: {}\nType: {}\nDegree: {}",
             node.label, node.id, node.source_file, node.node_type, degree
         ));
         write!(
@@ -91,12 +79,10 @@ pub fn export_html(
             color,
             cid.unwrap_or(0),
             size,
-        )
-        .unwrap();
+        )?;
     }
     vis_nodes.push(']');
 
-    // Build vis.js edges JSON array (only edges between included nodes)
     let mut vis_edges = String::from("[");
     first = true;
     for edge in graph.edges() {
@@ -113,7 +99,7 @@ pub fn export_html(
         };
         let width = 1.0 + edge.confidence_score * 2.0;
         let title_escaped = escape_js(&format!(
-            "{}: {} → {}\nConfidence: {:?} ({:.2})\nFile: {}",
+            "{}: {} → {}\nConfidence: {} ({:.2})\nFile: {}",
             edge.relation,
             edge.source,
             edge.target,
@@ -130,12 +116,10 @@ pub fn export_html(
             title_escaped,
             dashes,
             width,
-        )
-        .unwrap();
+        )?;
     }
     vis_edges.push(']');
 
-    // Build legend HTML
     let mut legend_html = String::new();
     for (&cid, label) in community_labels {
         let color = COMMUNITY_COLORS[cid % COMMUNITY_COLORS.len()];
@@ -144,11 +128,9 @@ pub fn export_html(
             r#"<div class="legend-item"><span class="legend-dot" style="background:{}"></span>{}</div>"#,
             color,
             escape_html(label),
-        )
-        .unwrap();
+        )?;
     }
 
-    // Build hyperedge info
     let mut hyperedge_html = String::new();
     for he in &graph.hyperedges {
         write!(
@@ -157,11 +139,9 @@ pub fn export_html(
             escape_html(&he.relation),
             escape_html(&he.label),
             he.nodes.join(", "),
-        )
-        .unwrap();
+        )?;
     }
 
-    // Banner for pruned graphs
     let prune_banner = if pruned {
         format!(
             r#"<div id="prune-banner">Showing top {} of {} nodes ({} edges total). Only highest-degree nodes and community representatives are displayed.</div>"#,
@@ -203,7 +183,6 @@ fn prune_nodes(
 ) -> HashSet<String> {
     let mut included: HashSet<String> = HashSet::new();
 
-    // 1. Add top nodes by degree
     let mut by_degree: Vec<(String, usize)> = graph
         .node_ids()
         .into_iter()
@@ -214,7 +193,6 @@ fn prune_nodes(
         .collect();
     by_degree.sort_by_key(|b| std::cmp::Reverse(b.1));
 
-    // Reserve slots for community representatives
     let community_slots = communities.len().min(max_nodes / 4);
     let degree_slots = max_nodes.saturating_sub(community_slots);
 
@@ -222,7 +200,6 @@ fn prune_nodes(
         included.insert(id.clone());
     }
 
-    // 2. Add community representatives (highest-degree node per community)
     for members in communities.values() {
         if included.len() >= max_nodes {
             break;
@@ -259,9 +236,8 @@ fn build_html_template(
     prune_banner: &str,
     is_large: bool,
 ) -> String {
-    // For large graphs: disable physics after stabilization, use Barnes-Hut
     let physics_config = if is_large {
-        r#"
+        r"
             solver: 'barnesHut',
             barnesHut: {
                 gravitationalConstant: -8000,
@@ -272,9 +248,9 @@ fn build_html_template(
                 avoidOverlap: 0.2
             },
             stabilization: { iterations: 150, fit: true },
-            adaptiveTimestep: true"#
+            adaptiveTimestep: true"
     } else {
-        r#"
+        r"
             solver: 'forceAtlas2Based',
             forceAtlas2Based: {
                 gravitationalConstant: -50,
@@ -284,15 +260,14 @@ fn build_html_template(
                 damping: 0.4,
                 avoidOverlap: 0.5
             },
-            stabilization: { iterations: 200 }"#
+            stabilization: { iterations: 200 }"
     };
 
-    // For large graphs: hide edge labels, smaller fonts
     let edge_font_size = if is_large { 0 } else { 10 };
     let node_font_size = if is_large { 10 } else { 12 };
 
     format!(
-        r##"<!DOCTYPE html>
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -334,11 +309,11 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
     </div>
     <div>
         <h3>Communities</h3>
-        <div id="legend">{legend}</div>
+        <div id="legend">{legend_html}</div>
     </div>
     <div id="hyperedges">
         <h3>Hyperedges</h3>
-        <ul>{hyperedges}</ul>
+        <ul>{hyperedge_html}</ul>
     </div>
 </div>
 <div id="graph-container">
@@ -346,8 +321,8 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
 </div>
 <script>
 (function() {{
-    var nodesData = {nodes};
-    var edgesData = {edges};
+    var nodesData = {vis_nodes};
+    var edgesData = {vis_edges};
 
     var container = document.getElementById('graph-container');
     var loading = document.getElementById('loading');
@@ -355,7 +330,7 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
     var edges = new vis.DataSet(edgesData);
 
     var options = {{
-        physics: {{{physics}}},
+        physics: {{{physics_config}}},
         nodes: {{
             shape: 'dot',
             font: {{ color: '#e0e0e0', size: {node_font_size} }},
@@ -377,18 +352,15 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
 
     var network = new vis.Network(container, {{ nodes: nodes, edges: edges }}, options);
 
-    // Hide loading and disable physics after stabilization
     network.on('stabilizationIterationsDone', function() {{
         loading.style.display = 'none';
         network.setOptions({{ physics: {{ enabled: false }} }});
     }});
 
-    // Fallback: hide loading after 10 seconds max
     setTimeout(function() {{
         loading.style.display = 'none';
     }}, 10000);
 
-    // Click to inspect
     network.on('click', function(params) {{
         var panel = document.getElementById('info-panel');
         if (params.nodes.length > 0) {{
@@ -406,7 +378,6 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
         }}
     }});
 
-    // Search (debounced, batch update)
     var searchInput = document.getElementById('search');
     var searchTimer = null;
     searchInput.addEventListener('input', function() {{
@@ -430,21 +401,9 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
 }})();
 </script>
 </body>
-</html>"##,
-        nodes = vis_nodes,
-        edges = vis_edges,
-        legend = legend_html,
-        hyperedges = hyperedge_html,
-        prune_banner = prune_banner,
-        physics = physics_config,
-        node_font_size = node_font_size,
-        edge_font_size = edge_font_size,
+</html>"#,
     )
 }
-
-// ---------------------------------------------------------------------------
-// Split HTML export: index (overview) + per-community pages
-// ---------------------------------------------------------------------------
 
 /// Export a split HTML visualization into `output_dir/html/`.
 ///
@@ -464,15 +423,7 @@ pub fn export_html_split(
     let html_dir = output_dir.join("html");
     fs::create_dir_all(&html_dir)?;
 
-    // Build reverse lookup
-    let mut node_community: HashMap<&str, usize> = HashMap::new();
-    for (&cid, members) in communities {
-        for nid in members {
-            node_community.insert(nid.as_str(), cid);
-        }
-    }
-
-    // ── Generate index.html (overview) ──
+    let node_community = graphify_core::build_node_to_community(communities);
     generate_overview(
         &html_dir,
         graph,
@@ -481,15 +432,14 @@ pub fn export_html_split(
         &node_community,
     )?;
 
-    // ── Generate per-community pages ──
     let mut sorted_cids: Vec<usize> = communities.keys().copied().collect();
-    sorted_cids.sort();
+    sorted_cids.sort_unstable();
     for &cid in &sorted_cids {
         let members = &communities[&cid];
         let label = community_labels
             .get(&cid)
             .cloned()
-            .unwrap_or_else(|| format!("Community {}", cid));
+            .unwrap_or_else(|| format!("Community {cid}"));
         generate_community_page(
             &html_dir,
             graph,
@@ -517,7 +467,6 @@ fn generate_overview(
     community_labels: &HashMap<usize, String>,
     node_community: &HashMap<&str, usize>,
 ) -> anyhow::Result<()> {
-    // Build super-nodes (one per community)
     let mut vis_nodes = String::from("[");
     let mut first = true;
     for (&cid, members) in communities {
@@ -528,7 +477,7 @@ fn generate_overview(
         let label = community_labels
             .get(&cid)
             .cloned()
-            .unwrap_or_else(|| format!("Community {}", cid));
+            .unwrap_or_else(|| format!("Community {cid}"));
         let color = COMMUNITY_COLORS[cid % COMMUNITY_COLORS.len()];
         let size = 20.0 + (members.len() as f64).sqrt() * 5.0;
         let title = format!(
@@ -545,12 +494,10 @@ fn generate_overview(
             title = escape_js(&title),
             color = color,
             size = size,
-        )
-        .unwrap();
+        )?;
     }
     vis_nodes.push(']');
 
-    // Build super-edges (cross-community connections, aggregated)
     let mut cross_edges: HashMap<(usize, usize), usize> = HashMap::new();
     for edge in graph.edges() {
         let src_cid = node_community.get(edge.source.as_str()).copied();
@@ -574,24 +521,18 @@ fn generate_overview(
         write!(
             vis_edges,
             r#"{{from:{from},to:{to},label:"{count}",width:{width:.1},title:"{count} cross-community edges"}}"#,
-            from = from,
-            to = to,
-            count = count,
-            width = width,
-        )
-        .unwrap();
+        )?;
     }
     vis_edges.push(']');
 
-    // Navigation links
     let mut nav_html = String::new();
     let mut sorted_cids: Vec<usize> = communities.keys().copied().collect();
-    sorted_cids.sort();
+    sorted_cids.sort_unstable();
     for cid in &sorted_cids {
         let label = community_labels
             .get(cid)
             .cloned()
-            .unwrap_or_else(|| format!("Community {}", cid));
+            .unwrap_or_else(|| format!("Community {cid}"));
         let color = COMMUNITY_COLORS[*cid % COMMUNITY_COLORS.len()];
         let count = communities[cid].len();
         write!(
@@ -601,12 +542,11 @@ fn generate_overview(
             color = color,
             label = escape_html(&label),
             count = count,
-        )
-        .unwrap();
+        )?;
     }
 
     let html = format!(
-        r##"<!DOCTYPE html>
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -667,7 +607,7 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
 }})();
 </script>
 </body>
-</html>"##,
+</html>"#,
         nodes = vis_nodes,
         edges = vis_edges,
         nav = nav_html,
@@ -690,10 +630,9 @@ fn generate_community_page(
     community_labels: &HashMap<usize, String>,
     node_community: &HashMap<&str, usize>,
 ) -> anyhow::Result<()> {
-    let member_set: HashSet<&str> = members.iter().map(|s| s.as_str()).collect();
+    let member_set: HashSet<&str> = members.iter().map(std::string::String::as_str).collect();
     let color = COMMUNITY_COLORS[cid % COMMUNITY_COLORS.len()];
 
-    // Build nodes
     let mut vis_nodes = String::from("[");
     let mut first = true;
     for node in graph.nodes() {
@@ -712,17 +651,15 @@ fn generate_community_page(
             escape_js(&node.id),
             escape_js(&node.label),
             escape_js(&format!(
-                "{}\nType: {:?}\nFile: {}\nDegree: {}",
+                "{}\nType: {}\nFile: {}\nDegree: {}",
                 node.label, node.node_type, node.source_file, degree
             )),
             color,
             size,
-        )
-        .unwrap();
+        )?;
     }
     vis_nodes.push(']');
 
-    // Build edges (internal only)
     let mut vis_edges = String::from("[");
     first = true;
     for edge in graph.edges() {
@@ -746,15 +683,13 @@ fn generate_community_page(
             escape_js(&edge.relation),
             dashes,
             escape_js(&format!(
-                "{}: {} → {}\nConfidence: {:?}",
+                "{}: {} → {}\nConfidence: {}",
                 edge.relation, edge.source, edge.target, edge.confidence
             )),
-        )
-        .unwrap();
+        )?;
     }
     vis_edges.push(']');
 
-    // Cross-community connections summary
     let mut external_links: HashMap<usize, usize> = HashMap::new();
     for node_id in members {
         for edge in graph.edges() {
@@ -782,7 +717,7 @@ fn generate_community_page(
         let ext_label = community_labels
             .get(ext_cid)
             .cloned()
-            .unwrap_or_else(|| format!("Community {}", ext_cid));
+            .unwrap_or_else(|| format!("Community {ext_cid}"));
         let ext_color = COMMUNITY_COLORS[*ext_cid % COMMUNITY_COLORS.len()];
         write!(
             nav_html,
@@ -791,8 +726,7 @@ fn generate_community_page(
             color = ext_color,
             label = escape_html(&ext_label),
             count = count,
-        )
-        .unwrap();
+        )?;
     }
 
     let is_large = members.len() > 500;
@@ -804,7 +738,7 @@ fn generate_community_page(
     let edge_font = if is_large { 0 } else { 10 };
 
     let html = format!(
-        r##"<!DOCTYPE html>
+        r#"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -887,8 +821,8 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
 }})();
 </script>
 </body>
-</html>"##,
-        title = escape_html(&format!("{} — Community {}", label, cid)),
+</html>"#,
+        title = escape_html(&format!("{label} — Community {cid}")),
         color = color,
         label = escape_html(label),
         cid = cid,
@@ -900,7 +834,7 @@ body {{ background: #0f0f1a; color: #e0e0e0; font-family: 'Segoe UI', system-ui,
         edge_font = edge_font,
     );
 
-    fs::write(html_dir.join(format!("community_{}.html", cid)), &html)?;
+    fs::write(html_dir.join(format!("community_{cid}.html")), &html)?;
     Ok(())
 }
 
@@ -979,7 +913,6 @@ mod tests {
 
     #[test]
     fn prune_nodes_caps_at_max() {
-        // Build a graph with 100 nodes
         let mut kg = KnowledgeGraph::new();
         for i in 0..100 {
             kg.add_node(GraphNode {
@@ -993,7 +926,6 @@ mod tests {
             })
             .unwrap();
         }
-        // Add some edges to give nodes different degrees
         for i in 0..50 {
             let _ = kg.add_edge(GraphEdge {
                 source: "n0".into(),
@@ -1016,7 +948,6 @@ mod tests {
 
         let pruned = prune_nodes(&kg, &communities, 20);
         assert!(pruned.len() <= 20, "should cap at 20, got {}", pruned.len());
-        // n0 (highest degree) must be included
         assert!(
             pruned.contains("n0"),
             "highest-degree node should be included"
@@ -1055,8 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn export_html_respects_max_nodes() {
-        // Build a graph with 10 nodes
+    fn export_html_respects_max_nodes() -> anyhow::Result<()> {
         let mut kg = KnowledgeGraph::new();
         for i in 0..10 {
             kg.add_node(GraphNode {
@@ -1089,16 +1019,14 @@ mod tests {
         let labels: HashMap<usize, String> = [(0, "All".into())].into();
         let dir = tempfile::tempdir().unwrap();
 
-        // With max_nodes=5, should prune (10 > 5)
         let path = export_html(&kg, &communities, &labels, dir.path(), Some(5)).unwrap();
         assert!(path.exists());
         let html = std::fs::read_to_string(&path).unwrap();
-        // n0 is highest degree, must appear
         assert!(html.contains("Node0"));
-        // Pruning banner should appear
         assert!(
             html.contains("pruned") || html.contains("Showing"),
             "should indicate pruning occurred"
         );
+        Ok(())
     }
 }

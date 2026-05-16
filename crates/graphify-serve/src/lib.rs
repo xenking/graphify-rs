@@ -3,11 +3,13 @@
 //! Provides graph traversal and scoring functions used by the query
 //! engine and MCP protocol server. Port of Python query tools.
 
+pub mod format;
 pub mod http;
 pub mod mcp;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::Path;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use graphify_core::{graph::KnowledgeGraph, model::NodeType, quality};
@@ -15,6 +17,8 @@ use graphify_embed::{SemanticEngine, SemanticMatch, default_index_path_for_graph
 use serde_json::Value;
 use thiserror::Error;
 use tracing::warn;
+
+pub use format::{GraphifyOutputFormat, format_value};
 
 /// Errors from the server.
 #[derive(Debug, Error)]
@@ -35,7 +39,8 @@ pub enum ServeError {
 /// the concrete upstream type is wrapped in a mutex here so HTTP handlers can
 /// share one loaded model safely without making public Sync assumptions.
 pub struct SemanticState {
-    engine: Mutex<SemanticEngine>,
+    index_path: PathBuf,
+    engine: Mutex<Option<SemanticEngine>>,
 }
 
 impl SemanticState {
@@ -50,7 +55,8 @@ impl SemanticState {
         let engine = SemanticEngine::load_for_graph(&index_path, graph)
             .map_err(|err| ServeError::GraphLoad(format!("load semantic index: {err:#}")))?;
         Ok(Some(Self {
-            engine: Mutex::new(engine),
+            index_path,
+            engine: Mutex::new(Some(engine)),
         }))
     }
 
@@ -60,10 +66,20 @@ impl SemanticState {
         question: &str,
         top_n: usize,
     ) -> std::result::Result<Vec<SemanticMatch>, ServeError> {
-        let engine = self
+        let mut engine = self
             .engine
             .lock()
             .map_err(|_| ServeError::GraphLoad("semantic engine lock poisoned".into()))?;
+        if engine.is_none() {
+            *engine = Some(
+                SemanticEngine::load_for_graph(&self.index_path, graph).map_err(|err| {
+                    ServeError::GraphLoad(format!("load semantic index: {err:#}"))
+                })?,
+            );
+        }
+        let engine = engine
+            .as_ref()
+            .ok_or_else(|| ServeError::GraphLoad("semantic engine unavailable".into()))?;
         engine
             .query(graph, question, top_n)
             .map_err(|err| ServeError::GraphLoad(format!("semantic query: {err:#}")))
@@ -71,7 +87,10 @@ impl SemanticState {
 
     pub fn description(&self) -> String {
         match self.engine.lock() {
-            Ok(engine) => format!("{} nodes via {}", engine.node_count(), engine.model()),
+            Ok(engine) => match engine.as_ref() {
+                Some(engine) => format!("{} nodes via {}", engine.node_count(), engine.model()),
+                None => format!("available at {}", self.index_path.display()),
+            },
             Err(_) => "semantic engine unavailable".to_string(),
         }
     }
@@ -142,6 +161,143 @@ pub fn score_nodes(graph: &KnowledgeGraph, terms: &[String]) -> Vec<(f64, String
     scored
 }
 
+/// Extract weighted-enough terms for graph lookup from a natural-language
+/// question. Keeps exact identifiers, splits snake_case/CamelCase, and drops
+/// generic prompt words that otherwise seed large noisy neighborhoods.
+pub fn query_search_terms(question: &str) -> Vec<String> {
+    let mut strong_terms = Vec::new();
+    let mut generic_terms = Vec::new();
+    let mut seen_strong = HashSet::new();
+    let mut seen_generic = HashSet::new();
+
+    for raw in question.split(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '.') {
+        if raw.is_empty() {
+            continue;
+        }
+
+        push_query_search_term(
+            raw,
+            &mut seen_strong,
+            &mut strong_terms,
+            &mut seen_generic,
+            &mut generic_terms,
+        );
+
+        for part in raw.split(['_', '.']) {
+            push_query_search_term(
+                part,
+                &mut seen_strong,
+                &mut strong_terms,
+                &mut seen_generic,
+                &mut generic_terms,
+            );
+            for camel in split_camel_part(part) {
+                push_query_search_term(
+                    &camel,
+                    &mut seen_strong,
+                    &mut strong_terms,
+                    &mut seen_generic,
+                    &mut generic_terms,
+                );
+            }
+        }
+    }
+
+    if strong_terms.is_empty() {
+        generic_terms
+    } else {
+        strong_terms
+    }
+}
+
+fn push_query_search_term(
+    raw: &str,
+    seen_strong: &mut HashSet<String>,
+    strong_terms: &mut Vec<String>,
+    seen_generic: &mut HashSet<String>,
+    generic_terms: &mut Vec<String>,
+) {
+    let term = raw.to_ascii_lowercase();
+    if term.len() <= 2 || is_query_stopword(&term) {
+        return;
+    }
+    if is_generic_query_term(&term) {
+        if seen_generic.insert(term.clone()) {
+            generic_terms.push(term);
+        }
+    } else if seen_strong.insert(term.clone()) {
+        strong_terms.push(term);
+    }
+}
+
+fn is_query_stopword(term: &str) -> bool {
+    matches!(
+        term,
+        "about"
+            | "after"
+            | "also"
+            | "and"
+            | "are"
+            | "can"
+            | "does"
+            | "for"
+            | "from"
+            | "get"
+            | "how"
+            | "into"
+            | "its"
+            | "near"
+            | "the"
+            | "this"
+            | "that"
+            | "was"
+            | "what"
+            | "when"
+            | "where"
+            | "which"
+            | "who"
+            | "why"
+            | "with"
+            | "without"
+            | "defined"
+            | "handled"
+            | "configured"
+            | "located"
+            | "related"
+            | "works"
+            | "used"
+            | "using"
+    )
+}
+
+fn is_generic_query_term(term: &str) -> bool {
+    matches!(
+        term,
+        "control"
+            | "controls"
+            | "controller"
+            | "controllers"
+            | "handler"
+            | "method"
+            | "native"
+            | "remote"
+            | "remotes"
+            | "feature"
+            | "features"
+            | "report"
+            | "reports"
+            | "web"
+            | "interface"
+            | "interfaces"
+            | "queue"
+            | "flow"
+            | "wire"
+            | "wires"
+            | "wired"
+            | "workflow"
+    )
+}
+
 fn node_type_multiplier(node_type: &NodeType) -> f64 {
     match node_type {
         NodeType::Function | NodeType::Method => 1.30,
@@ -161,9 +317,21 @@ fn normalize_search_terms(terms: &[String]) -> Vec<String> {
             if raw.len() > 2 {
                 normalized.push(raw.to_ascii_lowercase());
             }
-            if !raw.contains('_') {
+            if raw.contains('_') {
                 for part in raw.split('_').filter(|part| part.len() > 2) {
-                    normalized.push(part.to_ascii_lowercase());
+                    let part = part.to_ascii_lowercase();
+                    if !is_generic_query_term(&part) {
+                        normalized.push(part);
+                    }
+                }
+            }
+            for part in split_camel_part(raw)
+                .into_iter()
+                .filter(|part| part.len() > 2)
+            {
+                let part = part.to_ascii_lowercase();
+                if !is_generic_query_term(&part) {
+                    normalized.push(part);
                 }
             }
         }
@@ -171,6 +339,28 @@ fn normalize_search_terms(terms: &[String]) -> Vec<String> {
     normalized.sort();
     normalized.dedup();
     normalized
+}
+
+fn split_camel_part(raw: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = raw.chars().collect();
+    for (idx, ch) in chars.iter().enumerate() {
+        let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let next = chars.get(idx + 1).copied();
+        let boundary = idx > 0
+            && ch.is_ascii_uppercase()
+            && (prev.is_some_and(|p| p.is_ascii_lowercase() || p.is_ascii_digit())
+                || next.is_some_and(|n| n.is_ascii_lowercase()));
+        if boundary && !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+        }
+        current.push(*ch);
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
 }
 
 /// BFS traversal from start nodes up to a maximum depth.
@@ -262,14 +452,12 @@ pub fn subgraph_to_text(
     let char_budget = token_budget * 4;
     let mut output = String::with_capacity(char_budget.min(64 * 1024));
 
-    // Header
     output.push_str(&format!(
         "=== Knowledge Graph Context ({} nodes, {} edges) ===\n\n",
         nodes.len(),
         edges.len()
     ));
 
-    // Nodes section
     output.push_str("## Nodes\n\n");
     for node_id in nodes {
         if output.len() >= char_budget {
@@ -289,11 +477,9 @@ pub fn subgraph_to_text(
         }
     }
 
-    // Edges section
     if output.len() < char_budget {
         output.push_str("\n## Relationships\n\n");
 
-        // Deduplicate edges for display
         let mut seen: HashSet<(&str, &str)> = HashSet::new();
         for (src, tgt) in edges {
             if output.len() >= char_budget {
@@ -311,10 +497,6 @@ pub fn subgraph_to_text(
 
     output
 }
-
-// ---------------------------------------------------------------------------
-// Smart graph summarization
-// ---------------------------------------------------------------------------
 
 /// Abstraction level for graph summaries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,7 +544,6 @@ fn community_level_summary(
     let char_budget = token_budget * 4;
     let mut output = String::with_capacity(char_budget.min(64 * 1024));
 
-    // Pick representative (highest degree) for each community
     let mut representatives: HashMap<usize, (&str, usize)> = HashMap::new();
     for (&cid, members) in communities {
         let best = members
@@ -379,7 +560,6 @@ fn community_level_summary(
         graph.node_count()
     ));
 
-    // Node→community reverse map
     let mut node_cid: HashMap<&str, usize> = HashMap::new();
     for (&cid, members) in communities {
         for m in members {
@@ -387,7 +567,6 @@ fn community_level_summary(
         }
     }
 
-    // Communities
     output.push_str("## Communities\n\n");
     let mut sorted_cids: Vec<usize> = communities.keys().copied().collect();
     sorted_cids.sort();
@@ -411,7 +590,6 @@ fn community_level_summary(
         ));
     }
 
-    // Cross-community edges
     output.push_str("\n## Cross-Community Dependencies\n\n");
     let mut cross_edges: HashMap<(usize, usize), usize> = HashMap::new();
     for (src, tgt, _) in graph.edges_with_endpoints() {
@@ -442,7 +620,6 @@ fn architecture_level_summary(graph: &KnowledgeGraph, token_budget: usize) -> St
     let char_budget = token_budget * 4;
     let mut output = String::with_capacity(char_budget.min(64 * 1024));
 
-    // Group nodes by directory
     let mut dir_nodes: HashMap<String, Vec<&str>> = HashMap::new();
     for node in graph.nodes() {
         let dir = std::path::Path::new(&node.source_file)
@@ -453,7 +630,6 @@ fn architecture_level_summary(graph: &KnowledgeGraph, token_budget: usize) -> St
         dir_nodes.entry(dir).or_default().push(&node.id);
     }
 
-    // Node→dir mapping
     let mut node_dir: HashMap<&str, &str> = HashMap::new();
     for (dir, nodes) in &dir_nodes {
         for &nid in nodes {
@@ -466,7 +642,6 @@ fn architecture_level_summary(graph: &KnowledgeGraph, token_budget: usize) -> St
         dir_nodes.len()
     ));
 
-    // Directory summaries
     output.push_str("## Packages\n\n");
     let mut sorted_dirs: Vec<_> = dir_nodes.iter().collect();
     sorted_dirs.sort_by_key(|(_, nodes)| std::cmp::Reverse(nodes.len()));
@@ -478,7 +653,6 @@ fn architecture_level_summary(graph: &KnowledgeGraph, token_budget: usize) -> St
         output.push_str(&format!("- **{}** ({} entities)\n", dir, nodes.len()));
     }
 
-    // Inter-directory dependencies
     output.push_str("\n## Dependencies\n\n");
     let mut dir_edges: HashMap<(&str, &str), usize> = HashMap::new();
     for (src, tgt, _) in graph.edges_with_endpoints() {
@@ -503,9 +677,9 @@ fn architecture_level_summary(graph: &KnowledgeGraph, token_budget: usize) -> St
 
 /// Load a knowledge graph from a JSON file.
 pub fn load_graph(graph_path: &Path) -> Result<KnowledgeGraph, ServeError> {
-    let content = std::fs::read_to_string(graph_path)?;
-    let value: Value = serde_json::from_str(&content)?;
-    KnowledgeGraph::from_node_link_json(&value).map_err(|e| ServeError::GraphLoad(e.to_string()))
+    let file = std::fs::File::open(graph_path)?;
+    KnowledgeGraph::from_node_link_reader(BufReader::new(file))
+        .map_err(|e| ServeError::GraphLoad(e.to_string()))
 }
 
 /// Get basic statistics about the graph.
@@ -525,7 +699,6 @@ pub fn graph_stats(graph: &KnowledgeGraph) -> HashMap<String, Value> {
     };
     stats.insert("community_count".to_string(), Value::from(community_count));
 
-    // Degree statistics
     let node_ids = graph.node_ids();
     if !node_ids.is_empty() {
         let degrees: Vec<usize> = node_ids.iter().map(|id| graph.degree(id)).collect();
@@ -546,8 +719,6 @@ pub fn graph_stats(graph: &KnowledgeGraph) -> HashMap<String, Value> {
 /// Reads requests from stdin, writes responses to stdout.
 /// This is the entry point called by the CLI `serve` command.
 pub async fn start_server(graph_path: &Path) -> Result<(), ServeError> {
-    // Run the synchronous stdio loop; use spawn_blocking so we don't
-    // block the tokio runtime (though for stdio this is fine).
     let path = graph_path.to_path_buf();
     tokio::task::spawn_blocking(move || mcp::run_mcp_server(&path))
         .await
@@ -556,10 +727,6 @@ pub async fn start_server(graph_path: &Path) -> Result<(), ServeError> {
 }
 
 pub use http::{HttpServerConfig, start_http_server};
-
-// ---------------------------------------------------------------------------
-// Advanced graph algorithms
-// ---------------------------------------------------------------------------
 
 /// Find all simple paths between `source` and `target` up to `max_length` edges.
 ///
@@ -630,7 +797,6 @@ pub fn dijkstra_path(
         return Some((vec![source.to_string()], 0.0, Vec::new()));
     }
 
-    // Build adjacency with weights from edges
     let mut adj: HashMap<String, Vec<(String, f64, String)>> = HashMap::new();
     for (src, tgt, edge) in graph.edges_with_endpoints() {
         if edge.confidence_score < min_confidence {
@@ -705,7 +871,6 @@ pub fn dijkstra_path(
         }
     }
 
-    // Reconstruct path
     if !prev.contains_key(target) {
         return None;
     }
@@ -724,10 +889,6 @@ pub fn dijkstra_path(
     let total_cost = *dist.get(target).unwrap_or(&f64::MAX);
     Some((path, total_cost, edge_details))
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -775,11 +936,44 @@ mod tests {
     }
 
     #[test]
+    fn semantic_state_validates_index_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let graph = make_test_graph();
+        let index_path = graphify_embed::default_index_path_for_graph(&graph_path);
+        let index = graphify_embed::SemanticIndex {
+            version: 1,
+            model: "ollama:__graphify_test_missing_model__".to_string(),
+            graph_fingerprint: graphify_embed::graph_fingerprint(&graph),
+            dim: 1,
+            nodes: Vec::new(),
+        };
+        graphify_embed::write_index(&index, &index_path).unwrap();
+
+        let state = SemanticState::load_for_graph_path(&graph_path, &graph)
+            .unwrap()
+            .expect("semantic state should load");
+
+        assert!(state.description().contains("0 nodes via"));
+    }
+
+    #[test]
+    fn semantic_state_rejects_corrupt_index_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph_path = dir.path().join("graph.json");
+        let index_path = graphify_embed::default_index_path_for_graph(&graph_path);
+        std::fs::write(index_path, "{not-json").unwrap();
+
+        let result = SemanticState::load_for_graph_path(&graph_path, &make_test_graph());
+
+        assert!(matches!(result, Err(ServeError::GraphLoad(_))));
+    }
+
+    #[test]
     fn test_score_nodes_basic() {
         let g = make_test_graph();
         let results = score_nodes(&g, &["auth".to_string()]);
         assert!(!results.is_empty());
-        // "auth" node should score highest
         let top_id = &results[0].1;
         assert_eq!(top_id, "auth");
     }
@@ -797,6 +991,56 @@ mod tests {
         let results = score_nodes(&g, &["user".to_string(), "manager".to_string()]);
         assert!(!results.is_empty());
         assert!(results.iter().any(|(_, id)| id == "user"));
+    }
+
+    #[test]
+    fn query_search_terms_splits_identifiers_and_drops_prompt_filler() {
+        let terms = query_search_terms(
+            "Steam Controller Triton webOS native HID feature reports interface queue flow where control_hid wires into sdl_hid_feature_report and RemoteHID",
+        );
+
+        assert!(terms.contains(&"control_hid".to_string()));
+        assert!(terms.contains(&"hid".to_string()));
+        assert!(terms.contains(&"sdl_hid_feature_report".to_string()));
+        assert!(terms.contains(&"remotehid".to_string()));
+        assert!(!terms.contains(&"controller".to_string()));
+        assert!(!terms.contains(&"control".to_string()));
+        assert!(!terms.contains(&"remote".to_string()));
+        assert!(!terms.contains(&"web".to_string()));
+        assert!(!terms.contains(&"feature".to_string()));
+        assert!(!terms.contains(&"reports".to_string()));
+        assert!(!terms.contains(&"interface".to_string()));
+        assert!(!terms.contains(&"where".to_string()));
+    }
+
+    #[test]
+    fn query_search_terms_keeps_generic_terms_when_no_specific_terms_exist() {
+        let terms = query_search_terms("where are interfaces wired");
+
+        assert_eq!(terms, vec!["interfaces".to_string(), "wired".to_string()]);
+    }
+
+    #[test]
+    fn test_score_nodes_splits_snake_case_terms() {
+        let mut g = KnowledgeGraph::new();
+        g.add_node(make_node("control_hid", "control_hid()"))
+            .unwrap();
+        g.add_node(make_node("remote_hid", "RemoteHID")).unwrap();
+
+        let results = score_nodes(&g, &["control_hid".to_string()]);
+
+        assert_eq!(results[0].1, "control_hid");
+        assert!(results.iter().any(|(_, id)| id == "remote_hid"));
+    }
+
+    #[test]
+    fn test_score_nodes_does_not_split_identifier_into_generic_report_terms() {
+        let mut g = KnowledgeGraph::new();
+        g.add_node(make_node("report", "Report")).unwrap();
+
+        let results = score_nodes(&g, &["sdl_hid_feature_report".to_string()]);
+
+        assert!(results.is_empty());
     }
 
     #[test]
@@ -874,7 +1118,6 @@ mod tests {
     fn test_bfs_depth_1() {
         let g = make_test_graph();
         let (nodes, edges) = bfs(&g, &["auth".to_string()], 1);
-        // auth -> user, auth -> db
         assert!(nodes.len() >= 3); // auth, user, db
         assert!(!edges.is_empty());
     }
@@ -883,7 +1126,6 @@ mod tests {
     fn test_bfs_depth_2() {
         let g = make_test_graph();
         let (nodes, _edges) = bfs(&g, &["auth".to_string()], 2);
-        // Should reach all 4 nodes
         assert_eq!(nodes.len(), 4);
     }
 
@@ -924,7 +1166,6 @@ mod tests {
             ("auth".to_string(), "user".to_string()),
             ("auth".to_string(), "db".to_string()),
         ];
-        // Very small budget
         let text = subgraph_to_text(&g, &nodes, &edges, 10);
         assert!(text.contains("truncated") || text.len() < 200);
     }
@@ -962,21 +1203,17 @@ mod tests {
         assert!(nodes.len() >= 4);
     }
 
-    // -- all_simple_paths tests --
-
     #[test]
     fn test_all_simple_paths_direct() {
         let g = make_test_graph();
         let paths = all_simple_paths(&g, "auth", "user", 4);
         assert!(!paths.is_empty());
-        // Direct edge exists: auth → user
         assert!(paths.iter().any(|p| p.len() == 2));
     }
 
     #[test]
     fn test_all_simple_paths_indirect() {
         let g = make_test_graph();
-        // auth → db has direct path (len 2) and indirect auth → user → db (len 3)
         let paths = all_simple_paths(&g, "auth", "db", 4);
         assert!(
             paths.len() >= 2,
@@ -990,7 +1227,6 @@ mod tests {
         let mut g = KnowledgeGraph::new();
         g.add_node(make_node("a", "A")).unwrap();
         g.add_node(make_node("b", "B")).unwrap();
-        // No edge between a and b
         let paths = all_simple_paths(&g, "a", "b", 4);
         assert!(paths.is_empty());
     }
@@ -1010,8 +1246,6 @@ mod tests {
             assert!(w[0].len() <= w[1].len(), "paths should be sorted by length");
         }
     }
-
-    // -- dijkstra_path tests --
 
     #[test]
     fn test_dijkstra_direct_path() {
@@ -1052,13 +1286,11 @@ mod tests {
 
     #[test]
     fn test_dijkstra_min_confidence_filter() {
-        // Create graph with mixed confidence edges
         let mut g = KnowledgeGraph::new();
         g.add_node(make_node("a", "A")).unwrap();
         g.add_node(make_node("b", "B")).unwrap();
         g.add_node(make_node("c", "C")).unwrap();
 
-        // a→b: low confidence (0.3), a→c→b: high confidence (1.0)
         let mut low_edge = make_edge("a", "b");
         low_edge.confidence_score = 0.3;
         g.add_edge(low_edge).unwrap();
@@ -1071,7 +1303,6 @@ mod tests {
         high2.confidence_score = 1.0;
         g.add_edge(high2).unwrap();
 
-        // With min_confidence 0.5, should skip a→b and go a→c→b
         let result = dijkstra_path(&g, "a", "b", 0.5);
         assert!(result.is_some());
         let (path, _, _) = result.unwrap();

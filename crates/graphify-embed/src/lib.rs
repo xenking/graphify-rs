@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use graphify_core::graph::KnowledgeGraph;
@@ -300,7 +301,7 @@ pub fn split_model_spec(spec: &str) -> (&str, &str) {
 
 pub struct SemanticEngine {
     index: SemanticIndex,
-    encoder: Box<dyn TextEncoder>,
+    encoder: Mutex<Option<Box<dyn TextEncoder>>>,
 }
 
 impl SemanticEngine {
@@ -309,8 +310,12 @@ impl SemanticEngine {
         let graph_fingerprint = graph_fingerprint(graph);
         validate_index_for_graph(&index, &graph_fingerprint, &index.model)?;
         let (provider, model) = split_model_spec(&index.model);
-        let encoder = build_encoder(provider, model)?;
-        Ok(Self { index, encoder })
+        let encoder = build_encoder(provider, model)
+            .with_context(|| format!("load semantic encoder {}", index.model))?;
+        Ok(Self {
+            index,
+            encoder: Mutex::new(Some(encoder)),
+        })
     }
 
     pub fn query(
@@ -319,9 +324,18 @@ impl SemanticEngine {
         question: &str,
         top_n: usize,
     ) -> Result<Vec<SemanticMatch>> {
-        let embeddings = self
+        let mut encoder = self
             .encoder
-            .encode(&[question.to_string()], EmbedPurpose::Query)?;
+            .lock()
+            .map_err(|_| anyhow!("semantic encoder lock poisoned"))?;
+        if encoder.is_none() {
+            let (provider, model) = split_model_spec(&self.index.model);
+            *encoder = Some(build_encoder(provider, model)?);
+        }
+        let encoder = encoder
+            .as_ref()
+            .ok_or_else(|| anyhow!("semantic encoder unavailable"))?;
+        let embeddings = encoder.encode(&[question.to_string()], EmbedPurpose::Query)?;
         let query_embedding = embeddings
             .first()
             .ok_or_else(|| anyhow!("encoder returned no query embedding"))?;
@@ -608,11 +622,14 @@ fn snippet_for_node(
         return None;
     }
     let zero_based = line.saturating_sub(1);
+    if zero_based >= lines.len() {
+        return None;
+    }
     let start = zero_based.saturating_sub(SNIPPET_CONTEXT_LINES);
     let end = (zero_based + SNIPPET_CONTEXT_LINES + 1).min(lines.len());
     let mut snippet = lines[start..end].join("\n");
-    if snippet.len() > MAX_SNIPPET_CHARS {
-        snippet.truncate(MAX_SNIPPET_CHARS);
+    if snippet.chars().count() > MAX_SNIPPET_CHARS {
+        snippet = snippet.chars().take(MAX_SNIPPET_CHARS).collect();
         snippet.push('…');
     }
     Some(snippet)
@@ -758,19 +775,30 @@ const QUERY_STOPWORDS: &[&str] = &[
 ];
 
 fn query_terms(question: &str) -> Vec<QueryTerm> {
-    let mut terms = Vec::new();
+    let mut specific_terms = Vec::new();
+    let mut generic_terms = Vec::new();
     for raw in question.split(|ch: char| !ch.is_alphanumeric() && ch != '_') {
         if raw.is_empty() {
             continue;
         }
         let identifier_like = is_identifier_like(raw);
-        push_query_term(raw, identifier_like, &mut terms);
+        push_query_term(
+            raw,
+            identifier_like,
+            &mut specific_terms,
+            &mut generic_terms,
+        );
         if !raw.contains('_') {
             for part in split_camel(raw) {
-                push_query_term(&part, false, &mut terms);
+                push_query_term(&part, false, &mut specific_terms, &mut generic_terms);
             }
         }
     }
+    let mut terms = if specific_terms.is_empty() {
+        generic_terms
+    } else {
+        specific_terms
+    };
     terms.sort_by(|a, b| a.text.cmp(&b.text));
     terms.dedup_by(|a, b| {
         if a.text == b.text {
@@ -783,15 +811,25 @@ fn query_terms(question: &str) -> Vec<QueryTerm> {
     terms
 }
 
-fn push_query_term(raw: &str, exact_identifier: bool, terms: &mut Vec<QueryTerm>) {
+fn push_query_term(
+    raw: &str,
+    exact_identifier: bool,
+    specific_terms: &mut Vec<QueryTerm>,
+    generic_terms: &mut Vec<QueryTerm>,
+) {
     let term = raw.to_ascii_lowercase();
     if term.len() <= 2 || QUERY_STOPWORDS.contains(&term.as_str()) {
         return;
     }
-    terms.push(QueryTerm {
+    let query_term = QueryTerm {
         text: term,
         exact_identifier,
-    });
+    };
+    if is_generic_query_term(&query_term.text) {
+        generic_terms.push(query_term);
+    } else {
+        specific_terms.push(query_term);
+    }
 }
 
 fn is_identifier_like(raw: &str) -> bool {
@@ -822,6 +860,34 @@ fn split_camel(raw: &str) -> Vec<String> {
         parts.push(current);
     }
     parts
+}
+
+fn is_generic_query_term(term: &str) -> bool {
+    matches!(
+        term,
+        "control"
+            | "controls"
+            | "controller"
+            | "controllers"
+            | "feature"
+            | "features"
+            | "flow"
+            | "handler"
+            | "interface"
+            | "interfaces"
+            | "method"
+            | "native"
+            | "queue"
+            | "remote"
+            | "remotes"
+            | "report"
+            | "reports"
+            | "web"
+            | "wire"
+            | "wired"
+            | "wires"
+            | "workflow"
+    )
 }
 
 fn weight_terms(index: &SemanticIndex, terms: &[QueryTerm]) -> Vec<WeightedTerm> {
@@ -1008,7 +1074,7 @@ mod tests {
         graph
             .add_node(GraphNode {
                 id: "decimal_validator".into(),
-                label: "validateTournamentDecimal".into(),
+                label: "validateAmountDecimal".into(),
                 source_file: "./src/decimal.rs".into(),
                 source_location: Some("L3".into()),
                 node_type: NodeType::Function,
@@ -1030,6 +1096,49 @@ mod tests {
             })
             .unwrap();
         graph
+    }
+
+    #[test]
+    fn snippet_truncates_multibyte_text_on_char_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let source = format!("{}{}", "a".repeat(MAX_SNIPPET_CHARS - 1), "🚀🚀");
+        std::fs::write(dir.path().join("src/multibyte.go"), source).unwrap();
+        let node = GraphNode {
+            id: "multibyte".into(),
+            label: "multibyte".into(),
+            source_file: "./src/multibyte.go".into(),
+            source_location: Some("L1".into()),
+            node_type: NodeType::Function,
+            community: None,
+            extra: HashMap::new(),
+        };
+        let mut file_cache = HashMap::new();
+
+        let snippet = snippet_for_node(dir.path(), &node, &mut file_cache).unwrap();
+
+        assert!(snippet.ends_with('…'));
+        assert!(snippet.is_char_boundary(snippet.len()));
+        assert_eq!(snippet.chars().count(), MAX_SNIPPET_CHARS + 1);
+    }
+
+    #[test]
+    fn snippet_ignores_locations_past_end_of_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/short.go"), "package main\n").unwrap();
+        let node = GraphNode {
+            id: "short".into(),
+            label: "short".into(),
+            source_file: "./src/short.go".into(),
+            source_location: Some("L30".into()),
+            node_type: NodeType::Function,
+            community: None,
+            extra: HashMap::new(),
+        };
+        let mut file_cache = HashMap::new();
+
+        assert!(snippet_for_node(dir.path(), &node, &mut file_cache).is_none());
     }
 
     #[test]
@@ -1086,7 +1195,7 @@ mod tests {
             graph
                 .add_node(GraphNode {
                     id: id.into(),
-                    label: "validateTournamentDecimal".into(),
+                    label: "validateAmountDecimal".into(),
                     source_file: file.into(),
                     source_location: Some("L10".into()),
                     node_type: NodeType::Function,
@@ -1294,6 +1403,24 @@ mod tests {
     }
 
     #[test]
+    fn query_terms_drop_generic_prompt_words_when_identifiers_exist() {
+        let terms = query_terms(
+            "Steam Controller Triton webOS native HID feature reports interface queue flow where control_hid and sdl_hid_feature_report wire into RemoteHID",
+        );
+        let texts: Vec<_> = terms.iter().map(|term| term.text.as_str()).collect();
+
+        assert!(texts.contains(&"control_hid"));
+        assert!(texts.contains(&"sdl_hid_feature_report"));
+        assert!(texts.contains(&"remotehid"));
+        assert!(!texts.contains(&"controller"));
+        assert!(!texts.contains(&"feature"));
+        assert!(!texts.contains(&"reports"));
+        assert!(!texts.contains(&"interface"));
+        assert!(!texts.contains(&"flow"));
+        assert!(!texts.contains(&"wire"));
+    }
+
+    #[test]
     fn split_model_spec_supports_remote_prefixes() {
         assert_eq!(
             split_model_spec("ollama:embeddinggemma"),
@@ -1348,5 +1475,31 @@ mod tests {
 
         assert_eq!(loaded.model, "stub-model");
         assert_eq!(loaded.nodes[0].node_id, "kafka_sender");
+    }
+
+    #[test]
+    fn semantic_engine_rejects_unavailable_encoder_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(DEFAULT_INDEX_FILE);
+        let graph = make_graph();
+        let index = SemanticIndex {
+            version: INDEX_VERSION,
+            model: "model2vec:__definitely_missing_model__".into(),
+            graph_fingerprint: graph_fingerprint(&graph),
+            dim: 1,
+            nodes: vec![IndexedNode {
+                node_id: "kafka_sender".into(),
+                text: "kafka".into(),
+                embedding: vec![1.0],
+            }],
+        };
+        write_index(&index, &path).unwrap();
+
+        let result = SemanticEngine::load_for_graph(&path, &graph);
+
+        match result {
+            Ok(_) => panic!("unavailable encoder should fail during load"),
+            Err(err) => assert!(format!("{err:#}").contains("load semantic encoder")),
+        }
     }
 }

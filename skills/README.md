@@ -28,6 +28,7 @@ graphify-rs codex install
 
 This writes `AGENTS.md` guidance and a `.codex/hooks.json` hook-check entry.
 Use `graphifyq` from Codex for short-lived graph access. `graphifyq ensure/query` builds and uses the local Model2Vec semantic index by default, auto-refreshes stale per-repo graphs every 300s, and restarts its local HTTP sidecar after refresh; pass `--no-embed` for strict AST-only/offline startup or `--no-auto-refresh` for read-only checks.
+Codex skill guidance defaults agent-context `graphifyq query`, `summary`, `stats`, and `tool` calls to `--format toon`; omit it only for prose/human-readable output.
 
 LLM enrichment is explicit and can use installed CLIs instead of API keys. For
 Codex-backed extraction:

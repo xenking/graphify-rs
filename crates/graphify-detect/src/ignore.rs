@@ -14,10 +14,6 @@ use std::path::Path;
 
 use ignore_crate::gitignore::{Gitignore, GitignoreBuilder};
 
-// ---------------------------------------------------------------------------
-// load_graphifyignore
-// ---------------------------------------------------------------------------
-
 /// Read `.graphifyignore` from `root` and return the raw pattern strings.
 ///
 /// Returns an empty vec if the file does not exist. Patterns use gitignore
@@ -31,15 +27,11 @@ pub fn load_graphifyignore(root: &Path) -> Vec<String> {
 
     content
         .lines()
-        .map(|l| l.trim())
+        .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(|l| l.to_string())
+        .map(std::string::ToString::to_string)
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// IgnoreSet
-// ---------------------------------------------------------------------------
 
 /// Pre-compiled ignore matcher for efficient repeated checks.
 pub struct IgnoreSet {
@@ -115,10 +107,6 @@ pub fn is_ignored(path: &Path, root: &Path, patterns: &[String]) -> bool {
     let set = IgnoreSet::new(root, patterns);
     set.is_ignored(path, is_dir)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
